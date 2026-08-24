@@ -87,17 +87,27 @@ impl Task {
                 x: [0; 31],
                 sp: 0,
                 pc: entry as usize as u64,
-                spsr: 0
+                spsr: SPSR_EL1H,
         },
         stack: [0; 4096],
         };
-        let stack_top = task.stack.as_ptr() as u64 + 4096;
-        task.context.sp = stack_top & !0xF;
-
         task
+    }
+    fn save_context(&mut self, frame: &ExceptionFrame) {
+        self.context.x.copy_from_slice(&frame.x);
+        self.context.sp = frame.sp;
+        self.context.pc = frame.elr;
+        self.context.spsr = frame.spsr;
+    }
+    fn load_context(&self, frame: &mut ExceptionFrame) {
+        frame.x.copy_from_slice(&self.context.x);
+        frame.sp = self.context.sp;
+        frame.elr = self.context.pc;
+        frame.spsr = self.context.spsr;
     }
 }
 const MAX_TASKS: usize = 4;
+const SPSR_EL1H: u64 = 0b0101;
 struct TaskTable {
     tasks: [Option<Task>; MAX_TASKS],
     count: usize,
@@ -115,10 +125,13 @@ impl TaskTable{
         }
         let id = self.count;
         self.tasks[id] = Some(Task::new(id, entry));
+        let task = self.tasks[id].as_mut().unwrap();
+        let stack_top =
+            task.stack.as_ptr() as u64 + task.stack.len() as u64;
+        task.context.sp = stack_top & !0xF;
         self.count += 1;
-
         id
-    }
+        }
 }
 fn task_a() -> ! {
     let mut uart = Uart::new(0x0900_0000);
@@ -161,7 +174,25 @@ fn task_b() -> ! {
             self.current = (self.current + 1) % self.tasks.count;
             self.current
         }
+        fn save_current(&mut self, frame: &ExceptionFrame){
+            if self.tasks.count == 0{ return;}
+            if let Some(task) = &mut self.tasks.tasks[self.current]{
+                task.save_context(frame);
+            }
+        }
+        fn load_current(&self, frame: &mut ExceptionFrame){
+            if self.tasks.count == 0{ return; }
+            if let Some(task) = &self.tasks.tasks[self.current]{
+                task.load_context(frame);
+            }
+        }
+        fn load_task(&self, id: usize, frame: &mut ExceptionFrame) {
+            if let Some(task) = &self.tasks.tasks[id]{
+                task.load_context(frame);
+            }
+        }
     }
+    
     static mut SCHEDULER: Option<Scheduler> = None;
 
 // ============================================================
@@ -374,7 +405,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
     }
 }
 #[unsafe(no_mangle)]
-extern "C" fn exception_irq_rust(_frame: &mut ExceptionFrame, interrupt_id: u32){
+extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32){
     let mut uart = Uart::new(0x0900_0000);
 
     //writeln!(uart, "=== IRQ ===").ok();
@@ -390,8 +421,10 @@ extern "C" fn exception_irq_rust(_frame: &mut ExceptionFrame, interrupt_id: u32)
         let scheduler_ptr = &raw mut SCHEDULER;
 
         if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+            scheduler.save_current(frame);
             let next = scheduler.next();
             writeln!(uart, "TICK {} -> TASK {}", tick, next).ok();
+            scheduler.load_current(frame);
             }
         }
     }

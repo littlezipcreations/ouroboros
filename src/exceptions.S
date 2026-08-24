@@ -259,14 +259,17 @@ exception_irq_entry:
     str w19, [x2, #0x10]
 
 
-    // Restore ELR/SPSR.
+        // Restore ELR/SPSR.
     ldr x1, [sp, #256]
     msr elr_el1, x1
 
     ldr x1, [sp, #264]
     msr spsr_el1, x1
 
-    // Restore x0-x29.
+    // Save the SP that load_context() selected.
+    ldr x20, [sp, #248]
+
+    // Restore x0-x19.
     ldp x0,  x1,  [sp, #0]
     ldp x2,  x3,  [sp, #16]
     ldp x4,  x5,  [sp, #32]
@@ -277,20 +280,38 @@ exception_irq_entry:
     ldp x14, x15, [sp, #112]
     ldp x16, x17, [sp, #128]
     ldp x18, x19, [sp, #144]
-    ldp x20, x21, [sp, #160]
-    ldp x22, x23, [sp, #176]
-    ldp x24, x25, [sp, #192]
-    ldp x26, x27, [sp, #208]
-    ldp x28, x29, [sp, #224]
 
-    // Restore original x30.
-    ldr x30, [sp, #240]
+    // x20 is currently holding the new SP,
+    // so restore the task's x20 later.
 
-    // Discard frame and temporary x30 slot.
+    ldp x21, x22, [sp, #168]
+    ldp x23, x24, [sp, #184]
+    ldp x25, x26, [sp, #200]
+    ldp x27, x28, [sp, #216]
+
+    // Restore task x29.
+    ldr x29, [sp, #232]
+
+    // Restore task x30.
+    ldr x1, [sp, #240]
+    // x1 temporarily holds task x30.
+
+    // Save task x20 somewhere safe.
+    // We can use the old exception-frame memory temporarily.
+    str x20, [sp, #248]
+
+    // Put task x30 into x30.
+    mov x30, x1
+
+    // Recover task x20.
+    ldr x20, [sp, #160]
+
+    // Tear down the OLD exception frame.
     add sp, sp, #288
     add sp, sp, #16
 
-    eret
+    // Switch to the NEW task's stack.
+    ldr x1, [sp, #-16]       // not valid after switching!
 
 exception_fiq_entry:
     // Preserve original x30
