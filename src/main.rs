@@ -189,7 +189,6 @@ fn task_trampoline(entry: fn()) -> ! {
 
     task_exit()
 }
-
 fn task_exit() -> ! {
     unsafe {
         core::arch::asm!("svc #1");
@@ -201,6 +200,11 @@ fn task_exit() -> ! {
         core::hint::spin_loop();
     }
 }
+fn yield_now(){
+    unsafe{
+        core::arch::asm!("svc #2");
+    }
+}
 
 // ============================================================
 // Test tasks
@@ -209,12 +213,13 @@ fn task_exit() -> ! {
 fn task_a() {
     let mut uart = Uart::new(0x0900_0000);
 
-    for _ in 0..20 {
+    for _ in 0..10 {
         writeln!(uart, "Running test task A").ok();
 
-        for _ in 0..1_000_000 {
+        for _ in 0..500_000 {
             core::hint::spin_loop();
         }
+        yield_now();
     }
 }
 
@@ -224,9 +229,10 @@ fn task_b() {
     for _ in 0..20 {
         writeln!(uart, "Running test task B").ok();
 
-        for _ in 0..1_000_000 {
+        for _ in 0..500_000 {
             core::hint::spin_loop();
         }
+        yield_now();
     }
 }
 
@@ -270,19 +276,20 @@ impl Scheduler {
             return 0;
         }
 
-        // Search all real tasks.
-        //
-        // Task 0 is idle, so deliberately skip it here.
-        for _ in 1..self.tasks.count {
-            self.current = (self.current + 1) % self.tasks.count;
+        let start = self.current;
 
-            if self.current == 0 {
+        for offset in 1..self.tasks.count {
+            let candidate = (start + offset) % self.tasks.count;
+
+            // Task 0 is idle; only use it if there are no
+            // runnable real tasks.
+            if candidate == 0 {
                 continue;
             }
 
-            if let Some(task) = &self.tasks.tasks[self.current] {
+            if let Some(task) = &self.tasks.tasks[candidate] {
                 if task.state != TaskState::Dead {
-                    return self.current;
+                    return candidate;
                 }
             }
         }
@@ -381,6 +388,23 @@ impl Scheduler {
         if let Some(idle) = &mut self.tasks.tasks[0] {
             idle.state = TaskState::Running;
             idle.load_context(frame);
+        }
+    }
+    fn yield_current(&mut self, frame: &mut ExceptionFrame){
+        if self.tasks.count <= 1{
+            return;
+        }
+        if let Some(task) = &mut self.tasks.tasks[self.current]{
+            if self.current != 0 && task.state == TaskState::Running {
+                task.state = TaskState::Ready;
+            }
+            task.save_context(frame);
+        }
+        let next = self.next();
+        self.current = next;
+        if let Some(task) = &mut self.tasks.tasks[next]{
+            task.state = TaskState::Running;
+            task.load_context(frame);
         }
     }
 }
@@ -589,10 +613,42 @@ fn decode_data_abort(esr: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
     let mut uart = Uart::new(0x0900_0000);
-
+    let ec = (frame.esr >> 26) & 0x3f;
+    let il = (frame.esr >> 25) & 1;
+    let iss = frame.esr & 0x01ff_ffff;
     let sctlr: u64;
     let vbar: u64;
     let currentel: u64;
+    // --------------------------------------------------------
+    // SVC
+    //
+    // SVC #1 = task_exit()
+    // --------------------------------------------------------
+
+    if ec == 0x15 {
+        match iss {
+        1 => unsafe {
+            let scheduler_ptr = &raw mut SCHEDULER;
+
+            if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+                scheduler.exit_current(frame);
+                return;
+            }
+
+        panic!("SVC #1 with no scheduler");
+        },
+        2 => unsafe{
+            frame.elr += 4;
+            let scheduler_ptr = &raw mut SCHEDULER;
+            if let Some(scheduler) = (*scheduler_ptr).as_mut(){
+                scheduler.yield_current(frame);
+                return;
+            }
+            panic!("SVC #2 with no scheduler");
+        },
+        _=>{}
+    }
+}
 
     unsafe {
         core::arch::asm!(
@@ -609,9 +665,6 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
     writeln!(uart, "VBAR_EL1 = {:#018x}", vbar).ok();
     writeln!(uart, "CURRENTEL = {:#018x}", currentel).ok();
 
-    let ec = (frame.esr >> 26) & 0x3f;
-    let il = (frame.esr >> 25) & 1;
-    let iss = frame.esr & 0x01ff_ffff;
 
     writeln!(uart, "=== SYNCHRONOUS EXCEPTION ===").ok();
 
@@ -630,24 +683,6 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
     writeln!(uart, "ESR     = {:#018x}", frame.esr).ok();
     writeln!(uart, "FAR     = {:#018x}", frame.far).ok();
 
-    // --------------------------------------------------------
-    // SVC
-    //
-    // SVC #1 = task_exit()
-    // --------------------------------------------------------
-
-    if ec == 0x15 && iss == 1 {
-        unsafe {
-            let scheduler_ptr = &raw mut SCHEDULER;
-
-            if let Some(scheduler) = (*scheduler_ptr).as_mut() {
-                scheduler.exit_current(frame);
-                return;
-            }
-        }
-
-        panic!("SVC #1 with no scheduler");
-    }
 
     // --------------------------------------------------------
     // Test data abort recovery
@@ -710,7 +745,7 @@ extern "C" fn exception_irq_rust(
             scheduler.tick(frame);
 
             let mut uart = Uart::new(0x0900_0000);
-
+            if scheduler.current != 0{
             writeln!(
                 uart,
                 "TICK {} -> TASK {}",
@@ -718,6 +753,7 @@ extern "C" fn exception_irq_rust(
                 scheduler.current
             )
             .ok();
+        }
         }
     }
 }
