@@ -3,6 +3,7 @@
 mod exception;
 use exception::ExceptionFrame;
 
+core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
 
 use core::fmt::{self, Write};
@@ -82,9 +83,14 @@ impl Gic{
         }
     }
     fn enable(&self){
+        let mut uart = Uart::new(0x0900_0000);
+        writeln!(uart, "Enabling GIC distributor...").ok();
         self.write_dist(0x000, 1);
+        writeln!(uart, "Configuring CPU prority...").ok();
         self.write_cpu(0x004, 0xFF);
+        writeln!(uart, "Enabling GIC CPU interface...").ok();
         self.write_cpu(0x000, 1);
+        writeln!(uart, "GIC enabled! Returning to main...").ok();
     }
     fn sgi(&self, id: u8){
         let value = (1u32 << 16) | (id as u32);
@@ -260,16 +266,6 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Starting...").unwrap();
 
     unsafe {
-        let stack_top = core::ptr::addr_of!(STACK.0) as *const u8;
-        let stack_top = stack_top.add(16 * 1024);
-
-        writeln!(uart, "Modifying stack...").unwrap();
-
-        core::arch::asm!(
-            "mov sp, {}",
-            in(reg) stack_top,
-        );
-
         writeln!(uart, "Installing exception vector....").unwrap();
 
         let vector = exception_vector as *const ();
@@ -285,15 +281,24 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Enabling GIC...").unwrap();
     let gic = Gic::new();
     gic.enable();
-    writeln!(uart, "GIC enabled!").unwrap();
-    writeln!(uart, "Enabling IRQ...").unwrap();
-    unsafe{
-        core::arch::asm!("msr daifclr, #2");
+    writeln!(uart, "GIC enabled! Returned to main!").unwrap();
+    writeln!(uart, "Reading timer...").unwrap();
+    let freq: u64;
+    let counter: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, cntfrq_el0",
+            out(reg) freq,
+        );
+        core::arch::asm!(
+            "mrs {0}, cntpct_el0",
+            out(reg) counter,
+        );
     }
-    writeln!(uart, "IRQ enabled!").unwrap();
-    writeln!(uart, "Sending interrupt...").unwrap();
-    gic.sgi(0);
-    writeln!(uart, "Waiting for interrupt...").unwrap();
+    writeln!(uart, "Timer values: freq = {:#018x}, counter = {:#018x}", freq, counter).unwrap();
+    if freq == 0{
+        writeln!(uart, "Invalid timer frequency!").unwrap();
+    }
     writeln!(uart, "Calling WFE...").unwrap();
 
     loop {

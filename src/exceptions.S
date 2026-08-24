@@ -1,22 +1,3 @@
-.section .text.boot
-.global _start
-.extern rust_start
-.extern STACK
-
-_start:
-    // Set SP to the top of our kernel stack.
-    adrp x0, STACK
-    add  x0, x0, :lo12:STACK
-    add  x0, x0, #16384
-    mov  sp, x0
-
-    // Enter the Rust kernel.
-    bl rust_start
-
-1:
-    wfe
-    b 1b
-
 .section .text.exceptions
 .align 11
 
