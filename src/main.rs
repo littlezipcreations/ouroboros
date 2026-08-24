@@ -156,44 +156,47 @@ fn task_b() -> ! {
 // Scheduler
 // ============================================================
 
-    struct Scheduler {
-        tasks: TaskTable,
-        current: usize,
-    }
-    impl Scheduler{
-        fn new() -> Self{
-            Self { tasks: TaskTable::new(), current: 0, }
-        }
-        fn add_task(&mut self, entry: fn() -> !) -> usize {
-            self.tasks.create(entry)
-        }
-        fn next(&mut self) -> usize{
-            if self.tasks.count == 0{
-                return 0;
-            }
-            self.current = (self.current + 1) % self.tasks.count;
-            self.current
-        }
-        fn save_current(&mut self, frame: &ExceptionFrame){
-            if self.tasks.count == 0{ return;}
-            if let Some(task) = &mut self.tasks.tasks[self.current]{
-                task.save_context(frame);
-            }
-        }
-        fn load_current(&self, frame: &mut ExceptionFrame){
-            if self.tasks.count == 0{ return; }
-            if let Some(task) = &self.tasks.tasks[self.current]{
-                task.load_context(frame);
-            }
-        }
-        fn load_task(&self, id: usize, frame: &mut ExceptionFrame) {
-            if let Some(task) = &self.tasks.tasks[id]{
-                task.load_context(frame);
-            }
+ struct Scheduler {
+    tasks: TaskTable,
+    current: usize,
+    started: bool,
+}
+impl Scheduler {
+    fn new() -> Self {
+        Self {
+            tasks: TaskTable::new(),
+            current: 0,
+            started: false,
         }
     }
-    
-    static mut SCHEDULER: Option<Scheduler> = None;
+    fn add_task(&mut self, entry: fn() -> !) -> usize {
+        self.tasks.create(entry)
+    }
+    fn next(&mut self) -> usize {
+        if self.tasks.count == 0 {
+            return 0;
+        }
+        self.current = (self.current + 1) % self.tasks.count;
+        self.current
+    }
+    fn save_current(&mut self, frame: &ExceptionFrame) {
+        if self.tasks.count == 0 {
+            return;
+        }
+        if let Some(task) = &mut self.tasks.tasks[self.current] {
+            task.save_context(frame);
+        }
+    }
+    fn load_current(&self, frame: &mut ExceptionFrame) {
+        if self.tasks.count == 0 {
+            return;
+        }
+        if let Some(task) = &self.tasks.tasks[self.current] {
+            task.load_context(frame);
+        }
+    }
+}
+static mut SCHEDULER: Option<Scheduler> = None;
 
 // ============================================================
 // GIC distributor
