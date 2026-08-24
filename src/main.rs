@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(warnings)]
 mod exception;
 use exception::ExceptionFrame;
 
@@ -61,6 +62,107 @@ unsafe extern "C" {
 struct KernelStack([u8; 16 * 1024]);
 #[unsafe(no_mangle)]
 static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
+
+// ============================================================
+// Tasks
+// ============================================================
+
+#[repr(C)]
+struct CpuContext {
+    x:    [u64; 31],
+    sp:   u64,
+    pc:   u64,
+    spsr: u64,
+}
+struct Task{
+    id: usize,
+    context: CpuContext,
+    stack: [u8; 4096],
+}
+impl Task {
+    fn new(id: usize, entry: fn() -> !) -> Self{
+        let mut task = Self{
+            id,
+            context: CpuContext { 
+                x: [0; 31],
+                sp: 0,
+                pc: entry as usize as u64,
+                spsr: 0
+        },
+        stack: [0; 4096],
+        };
+        let stack_top = task.stack.as_ptr() as u64 + 4096;
+        task.context.sp = stack_top & !0xF;
+
+        task
+    }
+}
+const MAX_TASKS: usize = 4;
+struct TaskTable {
+    tasks: [Option<Task>; MAX_TASKS],
+    count: usize,
+}
+impl TaskTable{
+    fn new() -> Self {
+        Self {
+            tasks: core::array::from_fn(|_| None),
+            count: 0
+        }
+    }
+    fn create(&mut self, entry: fn() -> !) -> usize {
+        if self.count >= MAX_TASKS {
+            panic!("No free task slots");
+        }
+        let id = self.count;
+        self.tasks[id] = Some(Task::new(id, entry));
+        self.count += 1;
+
+        id
+    }
+}
+fn task_a() -> ! {
+    let mut uart = Uart::new(0x0900_0000);
+    loop {
+        writeln!(uart, "Running test task A").ok();
+        for _ in 0..1_000_000{
+            core::hint::spin_loop();
+        }
+    }
+}
+fn task_b() -> ! {
+    let mut uart = Uart::new(0x0900_0000);
+    loop {
+        writeln!(uart, "Running test task B").ok();
+        for _ in 0..1_000_000{
+            core::hint::spin_loop();
+        }
+    }
+}
+
+// ============================================================
+// Scheduler
+// ============================================================
+
+    struct Scheduler {
+        tasks: TaskTable,
+        current: usize,
+    }
+    impl Scheduler{
+        fn new() -> Self{
+            Self { tasks: TaskTable::new(), current: 0, }
+        }
+        fn add_task(&mut self, entry: fn() -> !) -> usize {
+            self.tasks.create(entry)
+        }
+        fn next(&mut self) -> usize{
+            if self.tasks.count == 0{
+                return 0;
+            }
+            self.current = (self.current + 1) % self.tasks.count;
+            self.current
+        }
+    }
+    static mut SCHEDULER: Option<Scheduler> = None;
 
 // ============================================================
 // GIC distributor
@@ -272,18 +374,27 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
     }
 }
 #[unsafe(no_mangle)]
-extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32){
+extern "C" fn exception_irq_rust(_frame: &mut ExceptionFrame, interrupt_id: u32){
     let mut uart = Uart::new(0x0900_0000);
 
     //writeln!(uart, "=== IRQ ===").ok();
     //writeln!(uart, "INTID = {}", interrupt_id).ok();
     if interrupt_id == 30{
         writeln!(uart, "(timer)").ok();
-    }
+    
     //writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
     //writeln!(uart, "SP = {:#018x}", frame.sp).ok();
     let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    writeln!(uart, "TICK {}.", tick).ok();
+    Timer::set_timeout(Timer::frequency() / 10);
+    unsafe {
+        let scheduler_ptr = &raw mut SCHEDULER;
+
+        if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+            let next = scheduler.next();
+            writeln!(uart, "TICK {} -> TASK {}", tick, next).ok();
+            }
+        }
+    }
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_fiq_rust(frame: &mut ExceptionFrame) {
@@ -314,6 +425,17 @@ extern "C" fn exception_serror_rust() -> ! {
 pub extern "C" fn rust_start() -> ! {
     let mut uart = Uart::new(0x0900_0000);
     writeln!(uart, "Starting...").unwrap();
+    writeln!(uart, "Initialising scheduler...").unwrap();
+    unsafe{
+        let scheduler = &raw mut SCHEDULER;
+        (*scheduler) = Some(Scheduler::new());
+
+        if let Some(scheduler) = (*scheduler).as_mut(){
+            scheduler.add_task(task_a);
+            scheduler.add_task(task_b);
+        }
+    }
+    writeln!(uart, "Scheduler initialised!").unwrap();
 
     unsafe {
         writeln!(uart, "Installing exception vector....").unwrap();
@@ -335,8 +457,8 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Reading timer...").unwrap();
     let freq = Timer::frequency();
     let counter = Timer::counter();
-    writeln!(uart, "Timer frequency: {:#018x} Hz", freq).unwrap();
-    writeln!(uart, "Timer counter: {:#018x}", counter).unwrap();
+    //writeln!(uart, "Timer frequency: {:#018x} Hz", freq).unwrap();
+    //writeln!(uart, "Timer counter: {:#018x}", counter).unwrap();
     writeln!(uart, "Arming timer...").unwrap();
     Timer::set_timeout( freq / 10);
     Timer::enable();

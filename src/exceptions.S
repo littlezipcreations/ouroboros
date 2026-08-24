@@ -204,37 +204,7 @@ exception_irq_entry:
     add x1, sp, #304
     str x1, [sp, #248]
 
-    // ELR.=== IRQ ===
-INTID = 30
-(timer)
-ELR = 0x00000000400023ec
-SP = 0x0000000040008f70
-TICK 45
-=== IRQ ===
-INTID = 30
-(timer)
-ELR = 0x00000000400023ec
-SP = 0x0000000040008f70
-TICK 46
-=== IRQ ===
-INTID = 30
-(timer)
-ELR = 0x00000000400023ec
-SP = 0x0000000040008f70
-TICK 47
-=== IRQ ===
-INTID = 30
-(timer)
-ELR = 0x00000000400023ec
-SP = 0x0000000040008f70
-TICK 48
-=== IRQ ===
-INTID = 30
-(timer)
-ELR = 0x00000000400023ec
-SP = 0x0000000040008f70
-TICK 49
-QEMU: Terminated
+    // ELR.
     mrs x1, elr_el1
     str x1, [sp, #256]
 
