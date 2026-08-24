@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 #![allow(warnings)]
+
 mod exception;
+
 use exception::ExceptionFrame;
 
 core::arch::global_asm!(include_str!("boot.S"));
@@ -10,6 +12,7 @@ core::arch::global_asm!(include_str!("exceptions.S"));
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
+
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================
@@ -60,6 +63,7 @@ unsafe extern "C" {
 
 #[repr(align(16))]
 struct KernelStack([u8; 16 * 1024]);
+
 #[unsafe(no_mangle)]
 static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
 
@@ -67,46 +71,66 @@ static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
 // Tasks
 // ============================================================
 
+const TASK_STACK_SIZE: usize = 16 * 1024;
+
 #[repr(C)]
-struct CpuContext {
-    x:    [u64; 31],
-    sp:   u64,
-    pc:   u64,
-    spsr: u64,
-}
-struct Task{
-    id: usize,
-    state: TaskState,
-    context: CpuContext,
-    stack: [u8; 4096],
-}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskState {
     Ready,
     Running,
     Dead,
 }
+
+#[repr(C)]
+struct CpuContext {
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    spsr: u64,
+}
+
+#[repr(C)]
+struct Task {
+    id: usize,
+    state: TaskState,
+    context: CpuContext,
+    stack: [u8; TASK_STACK_SIZE],
+}
+
 impl Task {
-    fn new(id: usize, entry: fn() -> !) -> Self{
-        let mut task = Self{
+    fn new(id: usize, entry: fn()) -> Self {
+        let mut task = Self {
             id,
             state: TaskState::Ready,
-            context: CpuContext { 
+
+            context: CpuContext {
                 x: [0; 31],
+
+                // Filled in after the task is moved into the task table.
                 sp: 0,
-                pc: entry as usize as u64,
+
+                // Every task starts through the trampoline.
+                pc: task_trampoline as usize as u64,
+
                 spsr: SPSR_EL1H,
-        },
-        stack: [0; 4096],
+            },
+
+            stack: [0; TASK_STACK_SIZE],
         };
+
+        // Pass the real task entry function in x0.
+        task.context.x[0] = entry as usize as u64;
+
         task
     }
+
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
         self.context.sp = frame.sp;
         self.context.pc = frame.elr;
         self.context.spsr = frame.spsr;
     }
+
     fn load_context(&self, frame: &mut ExceptionFrame) {
         frame.x.copy_from_slice(&self.context.x);
         frame.sp = self.context.sp;
@@ -114,51 +138,109 @@ impl Task {
         frame.spsr = self.context.spsr;
     }
 }
+
 const MAX_TASKS: usize = 4;
+
 const SPSR_EL1H: u64 = 0b0101;
+
 struct TaskTable {
     tasks: [Option<Task>; MAX_TASKS],
     count: usize,
 }
-impl TaskTable{
+
+impl TaskTable {
     fn new() -> Self {
         Self {
             tasks: core::array::from_fn(|_| None),
-            count: 0
+            count: 0,
         }
     }
-    fn create(&mut self, entry: fn() -> !) -> usize {
+
+    fn create(&mut self, entry: fn()) -> usize {
         if self.count >= MAX_TASKS {
             panic!("No free task slots");
         }
+
         let id = self.count;
+
         self.tasks[id] = Some(Task::new(id, entry));
+
+        // The task has now been moved into its final location.
+        // Calculate the stack pointer from the actual stored task.
         let task = self.tasks[id].as_mut().unwrap();
+
         let stack_top =
             task.stack.as_ptr() as u64 + task.stack.len() as u64;
+
         task.context.sp = stack_top & !0xF;
+
         self.count += 1;
+
         id
-        }
+    }
 }
-fn task_a() -> ! {
-    let mut uart = Uart::new(0x0900_0000);
+
+// ============================================================
+// Task trampoline / termination
+// ============================================================
+
+fn task_trampoline(entry: fn()) -> ! {
+    entry();
+
+    task_exit()
+}
+
+fn task_exit() -> ! {
+    unsafe {
+        core::arch::asm!("svc #1");
+    }
+
+    // The SVC should never return to us because the scheduler
+    // marks this task DEAD and switches to another task.
     loop {
+        core::hint::spin_loop();
+    }
+}
+
+// ============================================================
+// Test tasks
+// ============================================================
+
+fn task_a() {
+    let mut uart = Uart::new(0x0900_0000);
+
+    for _ in 0..20 {
         writeln!(uart, "Running test task A").ok();
-        for _ in 0..1_000_000{
+
+        for _ in 0..1_000_000 {
             core::hint::spin_loop();
         }
     }
 }
-fn task_b() -> ! {
+
+fn task_b() {
     let mut uart = Uart::new(0x0900_0000);
-    loop {
+
+    for _ in 0..20 {
         writeln!(uart, "Running test task B").ok();
-        for _ in 0..1_000_000{
+
+        for _ in 0..1_000_000 {
             core::hint::spin_loop();
         }
     }
 }
+
+// ============================================================
+// Kernel tasks
+// ============================================================
+
+    fn idle_task() {
+        loop{
+            unsafe{
+                core::arch::asm!("wfe");
+            }
+        }
+    }
 
 // ============================================================
 // Scheduler
@@ -169,6 +251,7 @@ struct Scheduler {
     current: usize,
     started: bool,
 }
+
 impl Scheduler {
     fn new() -> Self {
         Self {
@@ -177,137 +260,209 @@ impl Scheduler {
             started: false,
         }
     }
-    fn add_task(&mut self, entry: fn() -> !) -> usize {
+
+    fn add_task(&mut self, entry: fn()) -> usize {
         self.tasks.create(entry)
     }
+
     fn next(&mut self) -> usize {
         if self.tasks.count == 0 {
             return 0;
         }
-        self.current = (self.current + 1) % self.tasks.count;
-        self.current
-    }
-    fn save_current(&mut self, frame: &ExceptionFrame) {
-        if self.tasks.count == 0 {
-            return;
+
+        for _ in 0..self.tasks.count {
+            self.current = (self.current + 1) % self.tasks.count;
+
+            if let Some(task) = &self.tasks.tasks[self.current] {
+                if task.state != TaskState::Dead {
+                    return self.current;
+                }
+            }
         }
-        if let Some(task) = &mut self.tasks.tasks[self.current] {
-            task.save_context(frame);
-        }
+
+        panic!("No runnable tasks");
     }
+
     fn load_current(&self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
             return;
         }
+
         if let Some(task) = &self.tasks.tasks[self.current] {
             task.load_context(frame);
         }
     }
+
     fn tick(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
             return;
         }
+
+        // First timer interrupt starts task 0.
         if !self.started {
             self.started = true;
+
             if let Some(task) = &mut self.tasks.tasks[self.current] {
                 task.state = TaskState::Running;
                 task.load_context(frame);
             }
+
             return;
         }
-        // The currently running task is being preempted.
+
+        // Save the currently running task.
         if let Some(task) = &mut self.tasks.tasks[self.current] {
             if task.state == TaskState::Running {
                 task.state = TaskState::Ready;
             }
+
             task.save_context(frame);
         }
-        // Pick the next task.
+
+        // Select the next runnable task.
         let next = self.next();
+
         if let Some(task) = &mut self.tasks.tasks[next] {
             task.state = TaskState::Running;
             task.load_context(frame);
         }
     }
+
+    fn exit_current(&mut self, frame: &mut ExceptionFrame) {
+        if self.tasks.count == 0 {
+            panic!("No tasks");
+        }
+
+        let old = self.current;
+
+        // The task that invoked SVC is now dead.
+        if let Some(task) = &mut self.tasks.tasks[old] {
+            task.state = TaskState::Dead;
+            task.save_context(frame);
+        }
+
+        // Find another runnable task.
+        for _ in 0..self.tasks.count {
+            self.current = (self.current + 1) % self.tasks.count;
+
+            if let Some(task) = &self.tasks.tasks[self.current] {
+                if task.state != TaskState::Dead {
+                    let current = self.current;
+
+                    if let Some(task) = &mut self.tasks.tasks[current] {
+                        task.state = TaskState::Running;
+                        task.load_context(frame);
+                    }
+
+                    return;
+                }
+            }
+        }
+
+        // No runnable task remains.
+        panic!("No runnable tasks");
+    }
 }
+
 static mut SCHEDULER: Option<Scheduler> = None;
 
 // ============================================================
 // GIC distributor
 // ============================================================
 
-struct Gic{
+struct Gic {
     dist: usize,
     cpu: usize,
 }
-impl Gic{
-    const fn new() -> Self{
-        Self{dist: 0x0800_0000, cpu: 0x0801_0000}
+
+impl Gic {
+    const fn new() -> Self {
+        Self {
+            dist: 0x0800_0000,
+            cpu: 0x0801_0000,
+        }
     }
-    fn write_dist(&self, offset:usize, value: u32){
-        unsafe{
+
+    fn write_dist(&self, offset: usize, value: u32) {
+        unsafe {
             ((self.dist + offset) as *mut u32).write_volatile(value);
         }
     }
-    fn write_cpu(&self, offset:usize, value: u32){
-        unsafe{
+
+    fn write_cpu(&self, offset: usize, value: u32) {
+        unsafe {
             ((self.cpu + offset) as *mut u32).write_volatile(value);
         }
     }
-    fn enable(&self){
+
+    fn enable(&self) {
         let mut uart = Uart::new(0x0900_0000);
+
         writeln!(uart, "Enabling GIC distributor...").ok();
         self.write_dist(0x000, 1);
+
         writeln!(uart, "Enabling timer PPI...").ok();
         self.write_dist(0x100, 1 << 30);
+
         writeln!(uart, "Configuring CPU prority...").ok();
         self.write_cpu(0x004, 0xFF);
+
         writeln!(uart, "Enabling GIC CPU interface...").ok();
         self.write_cpu(0x000, 1);
+
         writeln!(uart, "GIC enabled! Returning to main...").ok();
     }
-    fn sgi(&self, id: u8){
+
+    fn sgi(&self, id: u8) {
         let value = (1u32 << 16) | (id as u32);
         self.write_dist(0xF00, value);
     }
 }
 
-// ===========================================================
+// ============================================================
 // Timer
-// ===========================================================
+// ============================================================
 
 struct Timer;
-impl Timer{
-    fn frequency() -> u64{
+
+impl Timer {
+    fn frequency() -> u64 {
         let freq: u64;
-        unsafe{
+
+        unsafe {
             core::arch::asm!(
                 "mrs {0}, cntfrq_el0",
                 out(reg) freq,
             );
         }
+
         freq
     }
-    fn counter() -> u64{
+
+    fn counter() -> u64 {
         let counter: u64;
-        unsafe{
+
+        unsafe {
             core::arch::asm!(
                 "mrs {0}, cntpct_el0",
                 out(reg) counter,
             );
         }
+
         counter
     }
-    fn set_timeout(ticks: u64){
-        unsafe{
+
+    fn set_timeout(ticks: u64) {
+        unsafe {
             core::arch::asm!(
                 "msr cntp_tval_el0, {0}",
                 in(reg) ticks,
             );
         }
     }
+
     fn enable() {
-        unsafe{
+        unsafe {
             core::arch::asm!(
                 "msr cntp_ctl_el0, {0}",
                 "isb",
@@ -318,7 +473,7 @@ impl Timer{
 }
 
 // ============================================================
-// Exception handlers
+// Exception decoding
 // ============================================================
 
 fn decode_esr(esr: u64) -> &'static str {
@@ -343,9 +498,12 @@ fn decode_esr(esr: u64) -> &'static str {
         _ => "Other synchronous exception",
     }
 }
+
 fn decode_data_abort(esr: u64) {
     let mut uart = Uart::new(0x0900_0000);
+
     let iss = esr & 0x01ff_ffff;
+
     let isv = (iss >> 24) & 1;
     let wnr = (iss >> 6) & 1;
     let sas = (iss >> 22) & 0x3;
@@ -358,6 +516,7 @@ fn decode_data_abort(esr: u64) {
         3 => "doubleword",
         _ => "unknown",
     };
+
     let fault = match dfsc {
         0x04 => "Translation fault, level 0",
         0x05 => "Translation fault, level 1",
@@ -374,24 +533,46 @@ fn decode_data_abort(esr: u64) {
 
         0x10 => "Synchronous external abort",
 
-        0x11 => "Synchronous external abort, translation table walk, level 1",
-        0x12 => "Synchronous external abort, translation table walk, level 2",
-        0x13 => "Synchronous external abort, translation table walk, level 3",
+        0x11 => {
+            "Synchronous external abort, translation table walk, level 1"
+        }
+
+        0x12 => {
+            "Synchronous external abort, translation table walk, level 2"
+        }
+
+        0x13 => {
+            "Synchronous external abort, translation table walk, level 3"
+        }
+
         _ => "Other data abort",
     };
+
     writeln!(uart, "Data abort details:").ok();
     writeln!(uart, "ISV = {}", isv).ok();
-    writeln!(uart, "Access = {}", if wnr == 1 { "write" } else { "read" }).ok();
+    writeln!(
+        uart,
+        "Access = {}",
+        if wnr == 1 { "write" } else { "read" }
+    )
+    .ok();
     writeln!(uart, "Access size = {}", access_size).ok();
     writeln!(uart, "DFSC = {:#04x}", dfsc).ok();
     writeln!(uart, "Fault = {}", fault).ok();
 }
+
+// ============================================================
+// Synchronous exceptions
+// ============================================================
+
 #[unsafe(no_mangle)]
-extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
+extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
     let mut uart = Uart::new(0x0900_0000);
-    let sctlr : u64;
+
+    let sctlr: u64;
     let vbar: u64;
     let currentel: u64;
+
     unsafe {
         core::arch::asm!(
             "mrs {0}, sctlr_el1",
@@ -402,6 +583,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
             out(reg) currentel,
         );
     }
+
     writeln!(uart, "SCTLR_EL1 = {:#018x}", sctlr).ok();
     writeln!(uart, "VBAR_EL1 = {:#018x}", vbar).ok();
     writeln!(uart, "CURRENTEL = {:#018x}", currentel).ok();
@@ -426,37 +608,103 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
     writeln!(uart, "SPSR    = {:#018x}", frame.spsr).ok();
     writeln!(uart, "ESR     = {:#018x}", frame.esr).ok();
     writeln!(uart, "FAR     = {:#018x}", frame.far).ok();
+
+    // --------------------------------------------------------
+    // SVC
+    //
+    // SVC #1 = task_exit()
+    // --------------------------------------------------------
+
+    if ec == 0x15 && iss == 1 {
+        unsafe {
+            let scheduler_ptr = &raw mut SCHEDULER;
+
+            if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+                scheduler.exit_current(frame);
+                return;
+            }
+        }
+
+        panic!("SVC #1 with no scheduler");
+    }
+
+    // --------------------------------------------------------
+    // Test data abort recovery
+    // --------------------------------------------------------
+
     if ec == 0x25 && frame.far == 0xDEAD_0000 {
         decode_data_abort(frame.esr);
+
         writeln!(uart, "Recovering from data abort...").ok();
+
         frame.elr += 4;
-    } else if ec == 0x3c {
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // BRK
+    // --------------------------------------------------------
+
+    if ec == 0x3c {
         frame.elr += 4;
-    } else {
-        writeln!(uart, "KERNEL PANIC! Unhandled exception!").ok();
-        loop {
-            unsafe {
-                core::arch::asm!("wfe");
-            }
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Unhandled exception
+    // --------------------------------------------------------
+
+    writeln!(uart, "KERNEL PANIC! Unhandled exception!").ok();
+
+    loop {
+        unsafe {
+            core::arch::asm!("wfe");
         }
     }
 }
+
+// ============================================================
+// IRQ
+// ============================================================
+
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
-extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame,interrupt_id: u32,) {
+extern "C" fn exception_irq_rust(
+    frame: &mut ExceptionFrame,
+    interrupt_id: u32,
+) {
     if interrupt_id != 30 {
         return;
     }
-    TICKS.fetch_add(1, Ordering::Relaxed);
+
+    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // 10 Hz scheduler tick.
     Timer::set_timeout(Timer::frequency() / 10);
+
     unsafe {
         let scheduler_ptr = &raw mut SCHEDULER;
 
         if let Some(scheduler) = (*scheduler_ptr).as_mut() {
             scheduler.tick(frame);
+
+            let mut uart = Uart::new(0x0900_0000);
+
+            writeln!(
+                uart,
+                "TICK {} -> TASK {}",
+                tick,
+                scheduler.current
+            )
+            .ok();
         }
     }
 }
+
+// ============================================================
+// FIQ
+// ============================================================
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_fiq_rust(frame: &mut ExceptionFrame) {
     let mut uart = Uart::new(0x0900_0000);
@@ -465,6 +713,11 @@ extern "C" fn exception_fiq_rust(frame: &mut ExceptionFrame) {
     writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
     writeln!(uart, "SP  = {:#018x}", frame.sp).ok();
 }
+
+// ============================================================
+// SError
+// ============================================================
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_serror_rust() -> ! {
     let mut uart = Uart::new(0x0900_0000);
@@ -485,8 +738,18 @@ extern "C" fn exception_serror_rust() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start() -> ! {
     let mut uart = Uart::new(0x0900_0000);
+
     writeln!(uart, "Starting...").unwrap();
+
+    // --------------------------------------------------------
+    // Enable FP/SIMD at EL1.
+    //
+    // LLVM may use Advanced SIMD instructions for ordinary
+    // Rust operations such as copies.
+    // --------------------------------------------------------
+
     writeln!(uart, "Enabling FP/SIMD...").unwrap();
+
     unsafe {
         core::arch::asm!(
             "mrs x0, cpacr_el1",
@@ -495,18 +758,32 @@ pub extern "C" fn rust_start() -> ! {
             "isb",
         );
     }
+
     writeln!(uart, "Enabled FP/SIMD!").unwrap();
+
+    // --------------------------------------------------------
+    // Scheduler
+    // --------------------------------------------------------
+
     writeln!(uart, "Initialising scheduler...").unwrap();
-    unsafe{
+
+    unsafe {
         let scheduler = &raw mut SCHEDULER;
+
         (*scheduler) = Some(Scheduler::new());
 
-        if let Some(scheduler) = (*scheduler).as_mut(){
+        if let Some(scheduler) = (*scheduler).as_mut() {
             scheduler.add_task(task_a);
             scheduler.add_task(task_b);
         }
     }
+
     writeln!(uart, "Scheduler initialised!").unwrap();
+
+    // --------------------------------------------------------
+    // Exception vector
+    // --------------------------------------------------------
+
     unsafe {
         writeln!(uart, "Installing exception vector....").unwrap();
 
@@ -518,22 +795,54 @@ pub extern "C" fn rust_start() -> ! {
             in(reg) vector,
         );
     }
+
     writeln!(uart, "Vector installed!").unwrap();
+
+    // --------------------------------------------------------
+    // GIC
+    // --------------------------------------------------------
+
     writeln!(uart, "Enabling GIC...").unwrap();
+
     let gic = Gic::new();
     gic.enable();
+
+    writeln!(uart, "GIC enabled! Returned to main!").unwrap();
+
+    // --------------------------------------------------------
+    // Timer
+    // --------------------------------------------------------
+
     writeln!(uart, "Reading timer...").unwrap();
+
     let freq = Timer::frequency();
-    let counter = Timer::counter();
-    //writeln!(uart, "Timer frequency: {:#018x} Hz", freq).unwrap();
-    //writeln!(uart, "Timer counter: {:#018x}", counter).unwrap();
+    let _counter = Timer::counter();
+
     writeln!(uart, "Arming timer...").unwrap();
-    Timer::set_timeout( freq / 10);
+
+    Timer::set_timeout(freq / 10);
     Timer::enable();
+
     writeln!(uart, "Timer armed!").unwrap();
+
+    // --------------------------------------------------------
+    // Enable IRQs.
+    // --------------------------------------------------------
+
     writeln!(uart, "Enabling CPU IRQs...").unwrap();
-    unsafe { core::arch::asm!("msr daifclr, #2");}
+
+    unsafe {
+        core::arch::asm!("msr daifclr, #2");
+    }
+
     writeln!(uart, "CPU IRQs enabled!").unwrap();
+
+    // --------------------------------------------------------
+    // Wait for first timer interrupt.
+    //
+    // The first timer tick loads task 0's initial context.
+    // --------------------------------------------------------
+
     writeln!(uart, "Calling WFE...").unwrap();
 
     loop {
