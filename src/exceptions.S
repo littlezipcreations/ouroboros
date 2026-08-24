@@ -204,7 +204,37 @@ exception_irq_entry:
     add x1, sp, #304
     str x1, [sp, #248]
 
-    // ELR.
+    // ELR.=== IRQ ===
+INTID = 30
+(timer)
+ELR = 0x00000000400023ec
+SP = 0x0000000040008f70
+TICK 45
+=== IRQ ===
+INTID = 30
+(timer)
+ELR = 0x00000000400023ec
+SP = 0x0000000040008f70
+TICK 46
+=== IRQ ===
+INTID = 30
+(timer)
+ELR = 0x00000000400023ec
+SP = 0x0000000040008f70
+TICK 47
+=== IRQ ===
+INTID = 30
+(timer)
+ELR = 0x00000000400023ec
+SP = 0x0000000040008f70
+TICK 48
+=== IRQ ===
+INTID = 30
+(timer)
+ELR = 0x00000000400023ec
+SP = 0x0000000040008f70
+TICK 49
+QEMU: Terminated
     mrs x1, elr_el1
     str x1, [sp, #256]
 
@@ -293,7 +323,86 @@ exception_irq_entry:
     eret
 
 exception_fiq_entry:
-    b .
+    // Preserve original x30
+    str x30, [sp, #-16]!
+
+    // Allocate ExceptionFrame
+    sub sp, sp, #288
+
+    // Save x0-x29
+    stp x0,  x1,  [sp, #0]
+    stp x2,  x3,  [sp, #16]
+    stp x4,  x5,  [sp, #32]
+    stp x6,  x7,  [sp, #48]
+    stp x8,  x9,  [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+
+    // Restore original x30 into frame
+    ldr x1, [sp, #288]
+    str x1, [sp, #240]
+
+    // Original SP
+    add x1, sp, #304
+    str x1, [sp, #248]
+
+    // ELR
+    mrs x1, elr_el1
+    str x1, [sp, #256]
+
+    // SPSR
+    mrs x1, spsr_el1
+    str x1, [sp, #264]
+
+    // ESR
+    mrs x1, esr_el1
+    str x1, [sp, #272]
+
+    // FAR
+    mrs x1, far_el1
+    str x1, [sp, #280]
+
+    mov x0, sp
+    bl exception_fiq_rust
+
+    // Restore ELR/SPSR
+    ldr x1, [sp, #256]
+    msr elr_el1, x1
+
+    ldr x1, [sp, #264]
+    msr spsr_el1, x1
+
+    // Restore registers
+    ldp x0,  x1,  [sp, #0]
+    ldp x2,  x3,  [sp, #16]
+    ldp x4,  x5,  [sp, #32]
+    ldp x6,  x7,  [sp, #48]
+    ldp x8,  x9,  [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+
+    ldr x30, [sp, #240]
+
+    add sp, sp, #288
+    add sp, sp, #16
+
+    eret
 
 exception_serror_entry:
-    b .
+    bl exception_serror_rust

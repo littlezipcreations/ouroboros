@@ -8,6 +8,8 @@ core::arch::global_asm!(include_str!("exceptions.S"));
 
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
+static TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================
 // UART
@@ -86,6 +88,8 @@ impl Gic{
         let mut uart = Uart::new(0x0900_0000);
         writeln!(uart, "Enabling GIC distributor...").ok();
         self.write_dist(0x000, 1);
+        writeln!(uart, "Enabling timer PPI...").ok();
+        self.write_dist(0x100, 1 << 30);
         writeln!(uart, "Configuring CPU prority...").ok();
         self.write_cpu(0x004, 0xFF);
         writeln!(uart, "Enabling GIC CPU interface...").ok();
@@ -98,9 +102,55 @@ impl Gic{
     }
 }
 
+// ===========================================================
+// Timer
+// ===========================================================
+
+struct Timer;
+impl Timer{
+    fn frequency() -> u64{
+        let freq: u64;
+        unsafe{
+            core::arch::asm!(
+                "mrs {0}, cntfrq_el0",
+                out(reg) freq,
+            );
+        }
+        freq
+    }
+    fn counter() -> u64{
+        let counter: u64;
+        unsafe{
+            core::arch::asm!(
+                "mrs {0}, cntpct_el0",
+                out(reg) counter,
+            );
+        }
+        counter
+    }
+    fn set_timeout(ticks: u64){
+        unsafe{
+            core::arch::asm!(
+                "msr cntp_tval_el0, {0}",
+                in(reg) ticks,
+            );
+        }
+    }
+    fn enable() {
+        unsafe{
+            core::arch::asm!(
+                "msr cntp_ctl_el0, {0}",
+                "isb",
+                in(reg) 1u64,
+            );
+        }
+    }
+}
+
 // ============================================================
 // Exception handlers
 // ============================================================
+
 fn decode_esr(esr: u64) -> &'static str {
     let ec = (esr >> 26) & 0x3f;
 
@@ -225,24 +275,24 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
 extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32){
     let mut uart = Uart::new(0x0900_0000);
 
-    writeln!(uart, "=== IRQ ===").ok();
-    writeln!(uart, "INTID = {}", interrupt_id).ok();
-    writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
-    writeln!(uart, "SP = {:#018x}", frame.sp).ok();
+    //writeln!(uart, "=== IRQ ===").ok();
+    //writeln!(uart, "INTID = {}", interrupt_id).ok();
+    if interrupt_id == 30{
+        writeln!(uart, "(timer)").ok();
+    }
+    //writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
+    //writeln!(uart, "SP = {:#018x}", frame.sp).ok();
+    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    writeln!(uart, "TICK {}.", tick).ok();
 }
 #[unsafe(no_mangle)]
-extern "C" fn exception_fiq_rust() -> ! {
+extern "C" fn exception_fiq_rust(frame: &mut ExceptionFrame) {
     let mut uart = Uart::new(0x0900_0000);
 
-    writeln!(uart, "FIQ exception!").ok();
-
-    loop {
-        unsafe {
-            core::arch::asm!("wfe");
-        }
-    }
+    writeln!(uart, "=== FIQ ===").ok();
+    writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
+    writeln!(uart, "SP  = {:#018x}", frame.sp).ok();
 }
-
 #[unsafe(no_mangle)]
 extern "C" fn exception_serror_rust() -> ! {
     let mut uart = Uart::new(0x0900_0000);
@@ -283,22 +333,17 @@ pub extern "C" fn rust_start() -> ! {
     gic.enable();
     writeln!(uart, "GIC enabled! Returned to main!").unwrap();
     writeln!(uart, "Reading timer...").unwrap();
-    let freq: u64;
-    let counter: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {0}, cntfrq_el0",
-            out(reg) freq,
-        );
-        core::arch::asm!(
-            "mrs {0}, cntpct_el0",
-            out(reg) counter,
-        );
-    }
-    writeln!(uart, "Timer values: freq = {:#018x}, counter = {:#018x}", freq, counter).unwrap();
-    if freq == 0{
-        writeln!(uart, "Invalid timer frequency!").unwrap();
-    }
+    let freq = Timer::frequency();
+    let counter = Timer::counter();
+    writeln!(uart, "Timer frequency: {:#018x} Hz", freq).unwrap();
+    writeln!(uart, "Timer counter: {:#018x}", counter).unwrap();
+    writeln!(uart, "Arming timer...").unwrap();
+    Timer::set_timeout( freq / 10);
+    Timer::enable();
+    writeln!(uart, "Timer armed!").unwrap();
+    writeln!(uart, "Enabling CPU IRQs...").unwrap();
+    unsafe { core::arch::asm!("msr daifclr, #2");}
+    writeln!(uart, "CPU IRQs enabled").unwrap();
     writeln!(uart, "Calling WFE...").unwrap();
 
     loop {
