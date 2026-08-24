@@ -234,13 +234,13 @@ fn task_b() {
 // Kernel tasks
 // ============================================================
 
-    fn idle_task() {
-        loop{
-            unsafe{
-                core::arch::asm!("wfe");
-            }
+fn idle_task() {
+    loop{
+        unsafe{
+            core::arch::asm!("wfe");
         }
     }
+}
 
 // ============================================================
 // Scheduler
@@ -266,12 +266,19 @@ impl Scheduler {
     }
 
     fn next(&mut self) -> usize {
-        if self.tasks.count == 0 {
+        if self.tasks.count <= 1 {
             return 0;
         }
 
-        for _ in 0..self.tasks.count {
+        // Search all real tasks.
+        //
+        // Task 0 is idle, so deliberately skip it here.
+        for _ in 1..self.tasks.count {
             self.current = (self.current + 1) % self.tasks.count;
+
+            if self.current == 0 {
+                continue;
+            }
 
             if let Some(task) = &self.tasks.tasks[self.current] {
                 if task.state != TaskState::Dead {
@@ -280,7 +287,8 @@ impl Scheduler {
             }
         }
 
-        panic!("No runnable tasks");
+        // No real task is runnable.
+        0
     }
 
     fn load_current(&self, frame: &mut ExceptionFrame) {
@@ -298,9 +306,15 @@ impl Scheduler {
             return;
         }
 
-        // First timer interrupt starts task 0.
+        // First timer: start the first real task.
         if !self.started {
             self.started = true;
+
+            self.current = if self.tasks.count > 1 {
+                1
+            } else {
+                0
+            };
 
             if let Some(task) = &mut self.tasks.tasks[self.current] {
                 task.state = TaskState::Running;
@@ -310,17 +324,19 @@ impl Scheduler {
             return;
         }
 
-        // Save the currently running task.
+        // Save current task.
         if let Some(task) = &mut self.tasks.tasks[self.current] {
-            if task.state == TaskState::Running {
+            if self.current != 0 && task.state == TaskState::Running {
                 task.state = TaskState::Ready;
             }
 
             task.save_context(frame);
         }
 
-        // Select the next runnable task.
+        // Find another runnable real task.
         let next = self.next();
+
+        self.current = next;
 
         if let Some(task) = &mut self.tasks.tasks[next] {
             task.state = TaskState::Running;
@@ -333,23 +349,23 @@ impl Scheduler {
             panic!("No tasks");
         }
 
-        let old = self.current;
+        if self.current == 0 {
+            panic!("Idle task cannot exit");
+        }
 
-        // The task that invoked SVC is now dead.
-        if let Some(task) = &mut self.tasks.tasks[old] {
+        // Kill current task.
+        if let Some(task) = &mut self.tasks.tasks[self.current] {
             task.state = TaskState::Dead;
             task.save_context(frame);
         }
 
-        // Find another runnable task.
-        for _ in 0..self.tasks.count {
-            self.current = (self.current + 1) % self.tasks.count;
-
-            if let Some(task) = &self.tasks.tasks[self.current] {
+        // Find another real runnable task.
+        for id in 1..self.tasks.count {
+            if let Some(task) = &self.tasks.tasks[id] {
                 if task.state != TaskState::Dead {
-                    let current = self.current;
+                    self.current = id;
 
-                    if let Some(task) = &mut self.tasks.tasks[current] {
+                    if let Some(task) = &mut self.tasks.tasks[id] {
                         task.state = TaskState::Running;
                         task.load_context(frame);
                     }
@@ -359,8 +375,13 @@ impl Scheduler {
             }
         }
 
-        // No runnable task remains.
-        panic!("No runnable tasks");
+        // No real tasks remain.
+        self.current = 0;
+
+        if let Some(idle) = &mut self.tasks.tasks[0] {
+            idle.state = TaskState::Running;
+            idle.load_context(frame);
+        }
     }
 }
 
@@ -773,6 +794,7 @@ pub extern "C" fn rust_start() -> ! {
         (*scheduler) = Some(Scheduler::new());
 
         if let Some(scheduler) = (*scheduler).as_mut() {
+            scheduler.add_task(idle_task);
             scheduler.add_task(task_a);
             scheduler.add_task(task_b);
         }
