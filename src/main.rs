@@ -413,21 +413,25 @@ extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32){
 
     //writeln!(uart, "=== IRQ ===").ok();
     //writeln!(uart, "INTID = {}", interrupt_id).ok();
-    if interrupt_id == 30{
-        writeln!(uart, "(timer)").ok();
-    
-    //writeln!(uart, "ELR = {:#018x}", frame.elr).ok();
-    //writeln!(uart, "SP = {:#018x}", frame.sp).ok();
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    Timer::set_timeout(Timer::frequency() / 10);
-    unsafe {
-        let scheduler_ptr = &raw mut SCHEDULER;
-
-        if let Some(scheduler) = (*scheduler_ptr).as_mut() {
-            scheduler.save_current(frame);
-            let next = scheduler.next();
-            writeln!(uart, "TICK {} -> TASK {}", tick, next).ok();
-            scheduler.load_current(frame);
+    if interrupt_id == 30 {
+        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        Timer::set_timeout(Timer::frequency() / 10);
+        unsafe {
+            let scheduler_ptr = &raw mut SCHEDULER;
+            if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+                if !scheduler.started {
+                    // First timer interrupt:
+                    // launch task 0 without advancing.
+                    scheduler.started = true;
+                    scheduler.load_current(frame);
+                    writeln!(uart, "TICK {} -> START TASK {}", tick, scheduler.current).ok();
+                } else {
+                    // Normal round-robin scheduling.
+                    scheduler.save_current(frame);
+                    let next = scheduler.next();
+                    writeln!(uart, "TICK {} -> TASK {}", tick, next).ok();
+                    scheduler.load_current(frame);
+                }
             }
         }
     }
@@ -461,6 +465,16 @@ extern "C" fn exception_serror_rust() -> ! {
 pub extern "C" fn rust_start() -> ! {
     let mut uart = Uart::new(0x0900_0000);
     writeln!(uart, "Starting...").unwrap();
+    writeln!(uart, "Enabling FP/SIMD...").unwrap();
+    unsafe {
+        core::arch::asm!(
+            "mrs x0, cpacr_el1",
+            "orr x0, x0, #(3 << 20)",
+            "msr cpacr_el1, x0",
+            "isb",
+        );
+    }
+    writeln!(uart, "Enabled FP/SIMD!").unwrap();
     writeln!(uart, "Initialising scheduler...").unwrap();
     unsafe{
         let scheduler = &raw mut SCHEDULER;
@@ -472,7 +486,6 @@ pub extern "C" fn rust_start() -> ! {
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
-
     unsafe {
         writeln!(uart, "Installing exception vector....").unwrap();
 
@@ -484,12 +497,10 @@ pub extern "C" fn rust_start() -> ! {
             in(reg) vector,
         );
     }
-
     writeln!(uart, "Vector installed!").unwrap();
     writeln!(uart, "Enabling GIC...").unwrap();
     let gic = Gic::new();
     gic.enable();
-    writeln!(uart, "GIC enabled! Returned to main!").unwrap();
     writeln!(uart, "Reading timer...").unwrap();
     let freq = Timer::frequency();
     let counter = Timer::counter();
@@ -501,7 +512,7 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Timer armed!").unwrap();
     writeln!(uart, "Enabling CPU IRQs...").unwrap();
     unsafe { core::arch::asm!("msr daifclr, #2");}
-    writeln!(uart, "CPU IRQs enabled").unwrap();
+    writeln!(uart, "CPU IRQs enabled!").unwrap();
     writeln!(uart, "Calling WFE...").unwrap();
 
     loop {

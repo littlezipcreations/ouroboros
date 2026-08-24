@@ -301,28 +301,24 @@ exception_irq_entry:
 
     str w19, [x2, #0x10]
 
-    // --------------------------------------------------------
-    // At this point Rust may have changed the ExceptionFrame.
+        // --------------------------------------------------------
+    // Rust may have replaced the frame with the NEXT task's
+    // context.
     //
-    // If the scheduler switched tasks, the frame now contains
-    // the NEXT task's registers, SP, ELR and SPSR.
+    // We need the new SP while also restoring the new task's
+    // x20. Use TPIDR_EL1 as temporary storage so we don't
+    // touch the task's stack.
     // --------------------------------------------------------
 
-    // Save the selected task's SP.
-    //
-    // We use x20 temporarily, so the task's actual x20 must
-    // be restored after switching stacks.
+    // Save the new task's x20 in TPIDR_EL1.
+    ldr x1, [sp, #160]
+    msr tpidr_el1, x1
+
+    // Save the new task's SP in x20.
     ldr x20, [sp, #248]
 
-    // Save the selected task's x20 on its own stack.
-    //
-    // The task's SP points at the top of its stack. Writing below
-    // SP is inside the allocated 4 KiB stack.
-    ldr x1, [sp, #160]
-    str x1, [x20, #-8]
-
     // --------------------------------------------------------
-    // Restore ELR/SPSR from the selected task.
+    // Restore ELR/SPSR.
     // --------------------------------------------------------
 
     ldr x1, [sp, #256]
@@ -332,10 +328,8 @@ exception_irq_entry:
     msr spsr_el1, x1
 
     // --------------------------------------------------------
-    // Restore x0-x19.
-    //
-    // x20 is intentionally skipped because it currently holds
-    // the new task's stack pointer.
+    // Restore all general-purpose registers except x20.
+    // x20 currently contains the new task's SP.
     // --------------------------------------------------------
 
     ldp x0,  x1,  [sp, #0]
@@ -349,9 +343,7 @@ exception_irq_entry:
     ldp x16, x17, [sp, #128]
     ldp x18, x19, [sp, #144]
 
-    // --------------------------------------------------------
-    // Restore x21-x29.
-    // --------------------------------------------------------
+    // x20 intentionally skipped.
 
     ldp x21, x22, [sp, #168]
     ldp x23, x24, [sp, #184]
@@ -359,16 +351,10 @@ exception_irq_entry:
     ldp x27, x28, [sp, #216]
 
     ldr x29, [sp, #232]
+    ldr x30, [sp, #240]
 
     // --------------------------------------------------------
-    // Restore x30.
-    // --------------------------------------------------------
-
-    ldr x1, [sp, #240]
-    mov x30, x1
-
-    // --------------------------------------------------------
-    // Throw away OLD task's exception frame.
+    // Destroy the OLD exception frame.
     // --------------------------------------------------------
 
     add sp, sp, #288
@@ -381,17 +367,16 @@ exception_irq_entry:
     mov sp, x20
 
     // --------------------------------------------------------
-    // Recover NEW task's x20.
+    // Recover the NEW task's x20.
     // --------------------------------------------------------
 
-    ldr x20, [sp, #-8]
+    mrs x20, tpidr_el1
 
     // --------------------------------------------------------
     // Return to NEW task.
     // --------------------------------------------------------
 
     eret
-
 
 // ============================================================
 // FIQ exception
