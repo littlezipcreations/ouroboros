@@ -76,13 +76,21 @@ struct CpuContext {
 }
 struct Task{
     id: usize,
+    state: TaskState,
     context: CpuContext,
     stack: [u8; 4096],
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    Ready,
+    Running,
+    Dead,
 }
 impl Task {
     fn new(id: usize, entry: fn() -> !) -> Self{
         let mut task = Self{
             id,
+            state: TaskState::Ready,
             context: CpuContext { 
                 x: [0; 31],
                 sp: 0,
@@ -156,7 +164,7 @@ fn task_b() -> ! {
 // Scheduler
 // ============================================================
 
- struct Scheduler {
+struct Scheduler {
     tasks: TaskTable,
     current: usize,
     started: bool,
@@ -192,6 +200,32 @@ impl Scheduler {
             return;
         }
         if let Some(task) = &self.tasks.tasks[self.current] {
+            task.load_context(frame);
+        }
+    }
+    fn tick(&mut self, frame: &mut ExceptionFrame) {
+        if self.tasks.count == 0 {
+            return;
+        }
+        if !self.started {
+            self.started = true;
+            if let Some(task) = &mut self.tasks.tasks[self.current] {
+                task.state = TaskState::Running;
+                task.load_context(frame);
+            }
+            return;
+        }
+        // The currently running task is being preempted.
+        if let Some(task) = &mut self.tasks.tasks[self.current] {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Ready;
+            }
+            task.save_context(frame);
+        }
+        // Pick the next task.
+        let next = self.next();
+        if let Some(task) = &mut self.tasks.tasks[next] {
+            task.state = TaskState::Running;
             task.load_context(frame);
         }
     }
@@ -408,31 +442,18 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame){
     }
 }
 #[unsafe(no_mangle)]
-extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32){
-    let mut uart = Uart::new(0x0900_0000);
+#[unsafe(no_mangle)]
+extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame,interrupt_id: u32,) {
+    if interrupt_id != 30 {
+        return;
+    }
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    Timer::set_timeout(Timer::frequency() / 10);
+    unsafe {
+        let scheduler_ptr = &raw mut SCHEDULER;
 
-    //writeln!(uart, "=== IRQ ===").ok();
-    //writeln!(uart, "INTID = {}", interrupt_id).ok();
-    if interrupt_id == 30 {
-        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        Timer::set_timeout(Timer::frequency() / 10);
-        unsafe {
-            let scheduler_ptr = &raw mut SCHEDULER;
-            if let Some(scheduler) = (*scheduler_ptr).as_mut() {
-                if !scheduler.started {
-                    // First timer interrupt:
-                    // launch task 0 without advancing.
-                    scheduler.started = true;
-                    scheduler.load_current(frame);
-                    writeln!(uart, "TICK {} -> START TASK {}", tick, scheduler.current).ok();
-                } else {
-                    // Normal round-robin scheduling.
-                    scheduler.save_current(frame);
-                    let next = scheduler.next();
-                    writeln!(uart, "TICK {} -> TASK {}", tick, next).ok();
-                    scheduler.load_current(frame);
-                }
-            }
+        if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+            scheduler.tick(frame);
         }
     }
 }
