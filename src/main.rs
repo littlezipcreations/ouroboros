@@ -202,7 +202,8 @@ fn task_exit() -> ! {
 }
 fn yield_now(){
     unsafe{
-        core::arch::asm!("svc #2");
+        core::arch::asm!("svc #2",
+        options(nomem, nostack));
     }
 }
 
@@ -211,28 +212,30 @@ fn yield_now(){
 // ============================================================
 
 fn task_a() {
-    let mut uart = Uart::new(0x0900_0000);
+    let mut value: u64 = 0xAAAAAAAAAAAAAAAA;
 
-    for _ in 0..10 {
-        writeln!(uart, "Running test task A").ok();
+    loop {
+        value = value.wrapping_mul(6364136223846793005);
+        value = value.wrapping_add(1);
 
-        for _ in 0..500_000 {
-            core::hint::spin_loop();
+        if value & 0xFFFF == 0 {
+            let mut uart = Uart::new(0x0900_0000);
+            writeln!(uart, "A value = {:#x}", value).ok();
         }
-        yield_now();
     }
 }
 
 fn task_b() {
-    let mut uart = Uart::new(0x0900_0000);
+    let mut value: u64 = 0xBBBBBBBBBBBBBBBB;
 
-    for _ in 0..20 {
-        writeln!(uart, "Running test task B").ok();
+    loop {
+        value = value.wrapping_mul(1442695040888963407);
+        value = value.wrapping_add(1);
 
-        for _ in 0..500_000 {
-            core::hint::spin_loop();
+        if value & 0xFFFF == 0 {
+            let mut uart = Uart::new(0x0900_0000);
+            writeln!(uart, "B value = {:#x}", value).ok();
         }
-        yield_now();
     }
 }
 
@@ -271,18 +274,17 @@ impl Scheduler {
         self.tasks.create(entry)
     }
 
-    fn next(&mut self) -> usize {
+   fn next(&self) -> usize {
         if self.tasks.count <= 1 {
             return 0;
         }
 
         let start = self.current;
 
+        // Prefer another alive real task.
         for offset in 1..self.tasks.count {
             let candidate = (start + offset) % self.tasks.count;
 
-            // Task 0 is idle; only use it if there are no
-            // runnable real tasks.
             if candidate == 0 {
                 continue;
             }
@@ -294,7 +296,17 @@ impl Scheduler {
             }
         }
 
-        // No real task is runnable.
+        // No other real task exists.
+        // Continue the current task if it is still alive.
+        if self.current != 0 {
+            if let Some(task) = &self.tasks.tasks[self.current] {
+                if task.state != TaskState::Dead {
+                    return self.current;
+                }
+            }
+        }
+
+        // No real tasks remain.
         0
     }
 
@@ -313,15 +325,10 @@ impl Scheduler {
             return;
         }
 
-        // First timer: start the first real task.
         if !self.started {
             self.started = true;
 
-            self.current = if self.tasks.count > 1 {
-                1
-            } else {
-                0
-            };
+            self.current = if self.tasks.count > 1 { 1 } else { 0 };
 
             if let Some(task) = &mut self.tasks.tasks[self.current] {
                 task.state = TaskState::Running;
@@ -331,16 +338,13 @@ impl Scheduler {
             return;
         }
 
-        // Save current task.
-        if let Some(task) = &mut self.tasks.tasks[self.current] {
-            if self.current != 0 && task.state == TaskState::Running {
+        if self.current != 0 {
+            if let Some(task) = &mut self.tasks.tasks[self.current] {
                 task.state = TaskState::Ready;
+                task.save_context(frame);
             }
-
-            task.save_context(frame);
         }
 
-        // Find another runnable real task.
         let next = self.next();
 
         self.current = next;
@@ -350,7 +354,6 @@ impl Scheduler {
             task.load_context(frame);
         }
     }
-
     fn exit_current(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
             panic!("No tasks");
@@ -390,19 +393,25 @@ impl Scheduler {
             idle.load_context(frame);
         }
     }
-    fn yield_current(&mut self, frame: &mut ExceptionFrame){
-        if self.tasks.count <= 1{
+    fn yield_current(&mut self, frame: &mut ExceptionFrame) {
+        if self.tasks.count <= 1 {
             return;
         }
-        if let Some(task) = &mut self.tasks.tasks[self.current]{
-            if self.current != 0 && task.state == TaskState::Running {
+
+        // Save the currently running real task.
+        if self.current != 0 {
+            if let Some(task) = &mut self.tasks.tasks[self.current] {
                 task.state = TaskState::Ready;
+                task.save_context(frame);
             }
-            task.save_context(frame);
         }
+
+        // Pick another READY task.
         let next = self.next();
+
         self.current = next;
-        if let Some(task) = &mut self.tasks.tasks[next]{
+
+        if let Some(task) = &mut self.tasks.tasks[next] {
             task.state = TaskState::Running;
             task.load_context(frame);
         }
@@ -638,7 +647,6 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
         panic!("SVC #1 with no scheduler");
         },
         2 => unsafe{
-            frame.elr += 4;
             let scheduler_ptr = &raw mut SCHEDULER;
             if let Some(scheduler) = (*scheduler_ptr).as_mut(){
                 scheduler.yield_current(frame);
@@ -747,12 +755,20 @@ extern "C" fn exception_irq_rust(
             let mut uart = Uart::new(0x0900_0000);
             if scheduler.current != 0{
             writeln!(
-                uart,
-                "TICK {} -> TASK {}",
-                tick,
-                scheduler.current
-            )
-            .ok();
+            uart,
+            "TICK {} -> TASK {} PC={:#018x} SP={:#018x}",
+            tick,
+            scheduler.current,
+            scheduler.tasks.tasks[scheduler.current]
+                .as_ref()
+                .map(|t| t.context.pc)
+                .unwrap_or(0),
+            scheduler.tasks.tasks[scheduler.current]
+                .as_ref()
+                .map(|t| t.context.sp)
+                .unwrap_or(0),
+        )
+        .ok();
         }
         }
     }

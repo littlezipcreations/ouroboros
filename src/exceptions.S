@@ -89,11 +89,6 @@ exception_sync_entry:
 
     // --------------------------------------------------------
     // Preserve original x30.
-    //
-    // Current SP -> original SP
-    // After this:
-    //
-    //   [original SP - 16] = x30
     // --------------------------------------------------------
 
     str x30, [sp, #-16]!
@@ -102,7 +97,7 @@ exception_sync_entry:
     sub sp, sp, #288
 
     // --------------------------------------------------------
-    // Save x0-x29
+    // Save x0-x29.
     // --------------------------------------------------------
 
     stp x0,  x1,  [sp, #0]
@@ -123,42 +118,65 @@ exception_sync_entry:
 
     // --------------------------------------------------------
     // Recover original x30.
-    // Current SP = original SP - 304
-    // Saved x30 = current SP + 288
     // --------------------------------------------------------
 
     ldr x1, [sp, #288]
     str x1, [sp, #240]
 
-    // Original SP = current SP + 304.
+    // Original SP.
     add x1, sp, #304
     str x1, [sp, #248]
 
-    // ELR_EL1
+    // ELR_EL1.
     mrs x1, elr_el1
     str x1, [sp, #256]
 
-    // SPSR_EL1
+    // SPSR_EL1.
     mrs x1, spsr_el1
     str x1, [sp, #264]
 
-    // ESR_EL1
+    // ESR_EL1.
     mrs x1, esr_el1
     str x1, [sp, #272]
 
-    // FAR_EL1
+    // FAR_EL1.
     mrs x1, far_el1
     str x1, [sp, #280]
 
     // --------------------------------------------------------
-    // exception_sync_rust(&mut ExceptionFrame)
+    // Call Rust.
+    // Rust may replace the frame with another task's context.
     // --------------------------------------------------------
 
     mov x0, sp
     bl exception_sync_rust
 
     // --------------------------------------------------------
-    // Restore ELR/SPSR
+    // The Rust scheduler may have replaced the frame with
+    // another task's context.
+    //
+    // We therefore need to:
+    //
+    //   1. save the new task's x20
+    //   2. load the new task's SP
+    //   3. restore ELR/SPSR/registers
+    //   4. destroy the OLD exception frame
+    //   5. switch to the NEW task's stack
+    //   6. restore x20
+    //   7. ERET
+    //
+    // TPIDR_EL1 is used as temporary storage for x20.
+    // --------------------------------------------------------
+
+    // Save NEW task's x20.
+    ldr x1, [sp, #160]
+    msr tpidr_el1, x1
+
+    // Save NEW task's SP in x20.
+    ldr x20, [sp, #248]
+
+    // --------------------------------------------------------
+    // Restore ELR/SPSR.
     // --------------------------------------------------------
 
     ldr x1, [sp, #256]
@@ -168,7 +186,7 @@ exception_sync_entry:
     msr spsr_el1, x1
 
     // --------------------------------------------------------
-    // Restore x0-x29
+    // Restore x0-x19.
     // --------------------------------------------------------
 
     ldp x0,  x1,  [sp, #0]
@@ -181,21 +199,45 @@ exception_sync_entry:
     ldp x14, x15, [sp, #112]
     ldp x16, x17, [sp, #128]
     ldp x18, x19, [sp, #144]
-    ldp x20, x21, [sp, #160]
-    ldp x22, x23, [sp, #176]
-    ldp x24, x25, [sp, #192]
-    ldp x26, x27, [sp, #208]
-    ldp x28, x29, [sp, #224]
 
-    // Restore x30.
+    // x20 intentionally skipped.
+
+    // --------------------------------------------------------
+    // Restore x21-x30.
+    // --------------------------------------------------------
+
+    ldp x21, x22, [sp, #168]
+    ldp x23, x24, [sp, #184]
+    ldp x25, x26, [sp, #200]
+    ldp x27, x28, [sp, #216]
+
+    ldr x29, [sp, #232]
     ldr x30, [sp, #240]
 
-    // Discard ExceptionFrame and temporary x30 slot.
+    // --------------------------------------------------------
+    // Destroy OLD exception frame.
+    // --------------------------------------------------------
+
     add sp, sp, #288
     add sp, sp, #16
 
-    eret
+    // --------------------------------------------------------
+    // Switch to NEW task's stack.
+    // --------------------------------------------------------
 
+    mov sp, x20
+
+    // --------------------------------------------------------
+    // Recover NEW task's x20.
+    // --------------------------------------------------------
+
+    mrs x20, tpidr_el1
+
+    // --------------------------------------------------------
+    // Return to NEW task.
+    // --------------------------------------------------------
+
+    eret
 
 // ============================================================
 // IRQ exception
