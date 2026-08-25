@@ -130,9 +130,6 @@ impl Task {
 
         task
     }
-}
-
-impl Task {
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
         self.context.sp = frame.sp;
@@ -228,6 +225,26 @@ fn task_b() {
         if B == 2000u64{task_exit();}
     }
     }
+fn task_c() { // RAM test
+    let mut uart = Uart::new(0x0900_0000);
+    writeln!(uart, "Checking RAM...").unwrap();
+    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap(); 
+    writeln!(uart, "RAM_START: {}", RAM_START).unwrap();
+    writeln!(uart, "RAM_END: {}", RAM_END).unwrap();
+    writeln!(uart, "KERNEL_END: {}", KERNEL_END).unwrap();
+    writeln!(uart, "FIRST_FREE_PAGE: {}", FIRST_FREE_PAGE).unwrap();
+    writeln!(uart, "PAGE_COUNT: {}", PAGE_COUNT).unwrap();
+    writeln!(uart, "BITMAP_SIZE: {}", BITMAP_SIZE).unwrap();
+    writeln!(uart, "Executing page test...").unwrap();
+    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
+    writeln!(uart, "Marking as used").unwrap();
+    mark_page_used(0);
+    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
+    writeln!(uart, "Marking as unused").unwrap();
+    mark_page_free(0);
+    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
+    writeln!(uart, "RAM tested!").unwrap();
+}
 // ============================================================
 // Idle
 // ============================================================
@@ -671,6 +688,7 @@ extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32) 
         if let Some(scheduler) = (*scheduler_ptr).as_mut() {
             scheduler.tick(frame);
             let mut uart = Uart::new(0x0900_0000);
+            if scheduler.current != 0 {
             writeln!(
                 uart,
                 "TICK {} -> TASK {} frame_pc={:#018x} saved_pc={:#018x} SP={:#018x}",
@@ -684,6 +702,7 @@ extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32) 
                 frame.sp,
             )
             .ok();
+        }
         }
     }
 }
@@ -735,6 +754,7 @@ pub extern "C" fn rust_start() -> ! {
             scheduler.add_task(idle_task);
             //scheduler.add_task(task_a);
             //scheduler.add_task(task_b);
+            scheduler.add_task(task_c);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
@@ -759,14 +779,6 @@ pub extern "C" fn rust_start() -> ! {
     Timer::set_timeout(freq / 10);
     Timer::enable();
     writeln!(uart, "Timer armed!").unwrap();
-    writeln!(uart, "Checking RAM...").unwrap();
-    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap(); 
-    writeln!(uart, "RAM_START: {}", RAM_START).unwrap();
-    writeln!(uart, "RAM_END: {}", RAM_END).unwrap();
-    writeln!(uart, "KERNEL_END: {}", KERNEL_END).unwrap();
-    writeln!(uart, "FIRST_FREE_PAGE: {}", FIRST_FREE_PAGE).unwrap();
-    writeln!(uart, "PAGE_COUNT: {}", PAGE_COUNT).unwrap();
-    writeln!(uart, "BITMAP_SIZE: {}", BITMAP_SIZE).unwrap();
     writeln!(uart, "Enabling CPU IRQs and passing to scheduler...").unwrap();
     unsafe {
         core::arch::asm!("msr daifclr, #2");
