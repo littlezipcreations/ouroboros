@@ -2,6 +2,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x40000000;
+    _kernel_start = .;
     .text : ALIGN(4096)
     {
         *(.text.boot)
@@ -29,4 +30,5 @@ SECTIONS
     {
         KEEP(*(.kernel_stack))
     }
+    _kernel_end = .;
 }

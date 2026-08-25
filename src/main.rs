@@ -64,6 +64,8 @@ enum TaskState {
     Ready,
     Running,
     Dead,
+    Unused, 
+    Blocked,
 }
 
 #[repr(C)]
@@ -187,7 +189,6 @@ fn task_exit() -> ! {
     unsafe {
         core::arch::asm!("svc #1");
     }
-
     loop {
         core::hint::spin_loop();
     }
@@ -207,22 +208,26 @@ fn task_a() {
     let mut uart = Uart::new(0x0900_0000);
     let mut A = 0u64;
     loop{
-        for _ in 0..200_000{ core::hint::spin_loop();}
+        for _ in 0..500_000{ core::hint::spin_loop();}
         unsafe {
             A = A.wrapping_add(1);
             writeln!(uart, "A value = {:#x}", A);
         }
+        if A == 100u64{task_exit();}
     }
 }
 fn task_b() {
-    let mut value: u64 = 0xBBBBBBBBBBBBBBBB;
-    loop {
-        value = value.wrapping_mul(1442695040888963407);
-        value = value.wrapping_add(1);
-        let mut uart = Uart::new(0x0900_0000);
-        writeln!(uart, "B value = {:#x}", value).ok();
+    let mut uart = Uart::new(0x0900_0000);
+    let mut B = 1000u64;
+    loop{
+        for _ in 0..500_000{core::hint::spin_loop();}
+        unsafe{
+            B = B.wrapping_add(1);
+            writeln!(uart, "B value = {:#x}", B);
+        }
+        if B == 2000u64{task_exit();}
     }
-}
+    }
 // ============================================================
 // Idle
 // ============================================================
@@ -463,6 +468,56 @@ impl Timer {
         }
     }
 }
+
+//RAM
+
+const PAGE_SIZE: usize = 4096; //4KiB
+const RAM_START: usize = 0x4000_0000;
+const RAM_END: usize = 0x6000_0000;
+const KERNEL_END: usize = 0x4000_C000;
+const FIRST_FREE_PAGE: usize = KERNEL_END;
+const PAGE_COUNT: usize = (RAM_END - FIRST_FREE_PAGE) / PAGE_SIZE;
+const BITMAP_SIZE: usize = (PAGE_COUNT + 7) / 8;
+static mut PAGE_BITMAP: [u8; BITMAP_SIZE] = [0; BITMAP_SIZE];
+unsafe extern "C"{
+    static _kernel_start: u8;
+    static _kernel_end: u8;
+}
+fn kernel_ram_helper(){
+    let mut uart = Uart::new(0x0900_0000);
+    let start = unsafe { &_kernel_start as *const u8 as usize};
+    let end = unsafe { &_kernel_end as *const u8 as usize};
+    writeln!(uart, "KERNEL START = {:#018x}", start).ok();
+    writeln!(uart, "KERNEL END = {:#018x}", end).ok();
+}
+fn is_page_used(page: usize) -> bool {
+    let byte = page / 8;
+    let bit = page % 8;
+    let mask = 1u8 << bit;
+
+    unsafe {
+        (PAGE_BITMAP[byte] & mask) != 0
+    }
+}
+fn mark_page_used(page: usize) {
+    let byte = page / 8;
+    let bit = page % 8;
+    let mask = 1u8 << bit;
+
+    unsafe {
+        PAGE_BITMAP[byte] |= mask;
+    }
+}
+fn mark_page_free(page: usize) {
+    let byte = page / 8;
+    let bit = page % 8;
+    let mask = 1u8 << bit;
+
+    unsafe {
+        PAGE_BITMAP[byte] &= !mask;
+    }
+}
+
 // ============================================================
 // Exception decoding
 // ============================================================
@@ -678,8 +733,8 @@ pub extern "C" fn rust_start() -> ! {
         (*scheduler) = Some(Scheduler::new());
         if let Some(scheduler) = (*scheduler).as_mut() {
             scheduler.add_task(idle_task);
-            scheduler.add_task(task_a);
-            scheduler.add_task(task_b);
+            //scheduler.add_task(task_a);
+            //scheduler.add_task(task_b);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
@@ -704,7 +759,15 @@ pub extern "C" fn rust_start() -> ! {
     Timer::set_timeout(freq / 10);
     Timer::enable();
     writeln!(uart, "Timer armed!").unwrap();
-    writeln!(uart, "Enabling CPU IRQs...").unwrap();
+    writeln!(uart, "Checking RAM...").unwrap();
+    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap(); 
+    writeln!(uart, "RAM_START: {}", RAM_START).unwrap();
+    writeln!(uart, "RAM_END: {}", RAM_END).unwrap();
+    writeln!(uart, "KERNEL_END: {}", KERNEL_END).unwrap();
+    writeln!(uart, "FIRST_FREE_PAGE: {}", FIRST_FREE_PAGE).unwrap();
+    writeln!(uart, "PAGE_COUNT: {}", PAGE_COUNT).unwrap();
+    writeln!(uart, "BITMAP_SIZE: {}", BITMAP_SIZE).unwrap();
+    writeln!(uart, "Enabling CPU IRQs and passing to scheduler...").unwrap();
     unsafe {
         core::arch::asm!("msr daifclr, #2");
     }
