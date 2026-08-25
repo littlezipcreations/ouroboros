@@ -1,520 +1,273 @@
 .section .text.exceptions
 .align 11
-
 .global exception_vector
 .global exception_sync_entry
 .global exception_irq_entry
 .global exception_fiq_entry
 .global exception_serror_entry
-
 .extern exception_sync_rust
 .extern exception_irq_rust
 .extern exception_fiq_rust
 .extern exception_serror_rust
 
+// ============================================================
+// Exception vector
+// ============================================================
 exception_vector:
-
-    // --------------------------------------------------------
-    // Current EL with SP0
-    // --------------------------------------------------------
-
-    .align 7
-    b exception_sync_entry
-    .align 7
-    b exception_irq_entry
-    .align 7
-    b exception_fiq_entry
-    .align 7
-    b exception_serror_entry
-
-    // --------------------------------------------------------
-    // Current EL with SPx
-    // --------------------------------------------------------
-
-    .align 7
-    b exception_sync_entry
-    .align 7
-    b exception_irq_entry
-    .align 7
-    b exception_fiq_entry
-    .align 7
-    b exception_serror_entry
-
-    // --------------------------------------------------------
-    // Lower EL using AArch64
-    // --------------------------------------------------------
-
-    .align 7
-    b exception_sync_entry
-    .align 7
-    b exception_irq_entry
-    .align 7
-    b exception_fiq_entry
-    .align 7
-    b exception_serror_entry
-
-    // --------------------------------------------------------
-    // Lower EL using AArch32
-    // --------------------------------------------------------
-
-    .align 7
-    b exception_sync_entry
-    .align 7
-    b exception_irq_entry
-    .align 7
-    b exception_fiq_entry
-    .align 7
-    b exception_serror_entry
-
+.align 7
+b exception_sync_entry
+.align 7
+b exception_irq_entry
+.align 7
+b exception_fiq_entry
+.align 7
+b exception_serror_entry
+.align 7
+b exception_sync_entry
+.align 7
+b exception_irq_entry
+.align 7
+b exception_fiq_entry
+.align 7
+b exception_serror_entry
+.align 7
+b exception_sync_entry
+.align 7
+b exception_irq_entry
+.align 7
+b exception_fiq_entry
+.align 7
+b exception_serror_entry
+.align 7
+b exception_sync_entry
+.align 7
+b exception_irq_entry
+.align 7
+b exception_fiq_entry
+.align 7
+b exception_serror_entry
 
 // ============================================================
-// Synchronous exception
+// ExceptionFrame
 //
-// ExceptionFrame:
+// 0x000  x0
+// 0x008  x1
+// ...
+// 0x0F0  x30
+// 0x0F8  sp
+// 0x100  elr
+// 0x108  spsr
+// 0x110  esr
+// 0x118  far
 //
-//   +0    x0
-//   +8    x1
-//   ...
-//   +240  x30
-//   +248  original SP
-//   +256  ELR_EL1
-//   +264  SPSR_EL1
-//   +272  ESR_EL1
-//   +280  FAR_EL1
-//
-// Total: 288 bytes
+// Total = 0x120 = 288 bytes
 // ============================================================
 
-exception_sync_entry:
-
+// ============================================================
+// Common context restore
+//
+// Entry:
+//   SP = current exception frame
+//
+// This routine expects the frame to contain the context that
+// should be resumed.
+//
+// Important:
+//   x20 is temporarily used to hold the new task's SP.
+//   TPIDR_EL1 temporarily holds the new task's x20.
+//
+// This is safe because TPIDR_EL1 is not part of the task's
+// architectural execution context here.
+// ============================================================
+exception_restore_context:
     // --------------------------------------------------------
-    // Preserve original x30.
-    // --------------------------------------------------------
-
-    str x30, [sp, #-16]!
-
-    // Allocate ExceptionFrame.
-    sub sp, sp, #288
-
-    // --------------------------------------------------------
-    // Save x0-x29.
-    // --------------------------------------------------------
-
-    stp x0,  x1,  [sp, #0]
-    stp x2,  x3,  [sp, #16]
-    stp x4,  x5,  [sp, #32]
-    stp x6,  x7,  [sp, #48]
-    stp x8,  x9,  [sp, #64]
-    stp x10, x11, [sp, #80]
-    stp x12, x13, [sp, #96]
-    stp x14, x15, [sp, #112]
-    stp x16, x17, [sp, #128]
-    stp x18, x19, [sp, #144]
-    stp x20, x21, [sp, #160]
-    stp x22, x23, [sp, #176]
-    stp x24, x25, [sp, #192]
-    stp x26, x27, [sp, #208]
-    stp x28, x29, [sp, #224]
-
-    // --------------------------------------------------------
-    // Recover original x30.
-    // --------------------------------------------------------
-
-    ldr x1, [sp, #288]
-    str x1, [sp, #240]
-
-    // Original SP.
-    add x1, sp, #304
-    str x1, [sp, #248]
-
-    // ELR_EL1.
-    mrs x1, elr_el1
-    str x1, [sp, #256]
-
-    // SPSR_EL1.
-    mrs x1, spsr_el1
-    str x1, [sp, #264]
-
-    // ESR_EL1.
-    mrs x1, esr_el1
-    str x1, [sp, #272]
-
-    // FAR_EL1.
-    mrs x1, far_el1
-    str x1, [sp, #280]
-
-    // --------------------------------------------------------
-    // Call Rust.
-    // Rust may replace the frame with another task's context.
-    // --------------------------------------------------------
-
-    mov x0, sp
-    bl exception_sync_rust
-
-    // --------------------------------------------------------
-    // The Rust scheduler may have replaced the frame with
-    // another task's context.
+    // Save the destination task's SP in TPIDR_EL1.
     //
-    // We therefore need to:
-    //
-    //   1. save the new task's x20
-    //   2. load the new task's SP
-    //   3. restore ELR/SPSR/registers
-    //   4. destroy the OLD exception frame
-    //   5. switch to the NEW task's stack
-    //   6. restore x20
-    //   7. ERET
-    //
-    // TPIDR_EL1 is used as temporary storage for x20.
+    // We cannot use an ordinary register because all x0-x30
+    // must eventually be restored.
     // --------------------------------------------------------
 
-    // Save NEW task's x20.
-    ldr x1, [sp, #160]
-    msr tpidr_el1, x1
-
-    // Save NEW task's SP in x20.
-    ldr x20, [sp, #248]
+    ldr     x20, [sp, #0x0F8]
+    ldr     x1,  [sp, #0x0A0]
+    msr     tpidr_el1, x1
 
     // --------------------------------------------------------
     // Restore ELR/SPSR.
     // --------------------------------------------------------
 
-    ldr x1, [sp, #256]
-    msr elr_el1, x1
+    ldr     x1, [sp, #0x100]
+    msr     elr_el1, x1
 
-    ldr x1, [sp, #264]
-    msr spsr_el1, x1
-
-    // --------------------------------------------------------
-    // Restore x0-x19.
-    // --------------------------------------------------------
-
-    ldp x0,  x1,  [sp, #0]
-    ldp x2,  x3,  [sp, #16]
-    ldp x4,  x5,  [sp, #32]
-    ldp x6,  x7,  [sp, #48]
-    ldp x8,  x9,  [sp, #64]
-    ldp x10, x11, [sp, #80]
-    ldp x12, x13, [sp, #96]
-    ldp x14, x15, [sp, #112]
-    ldp x16, x17, [sp, #128]
-    ldp x18, x19, [sp, #144]
-
-    // x20 intentionally skipped.
+    ldr     x1, [sp, #0x108]
+    msr     spsr_el1, x1
 
     // --------------------------------------------------------
-    // Restore x21-x30.
+    // Restore registers.
+    //
+    // x20 is deliberately skipped because it is currently
+    // holding the destination SP.
     // --------------------------------------------------------
 
-    ldp x21, x22, [sp, #168]
-    ldp x23, x24, [sp, #184]
-    ldp x25, x26, [sp, #200]
-    ldp x27, x28, [sp, #216]
+    ldp     x0,  x1,  [sp, #0x000]
+    ldp     x2,  x3,  [sp, #0x010]
+    ldp     x4,  x5,  [sp, #0x020]
+    ldp     x6,  x7,  [sp, #0x030]
+    ldp     x8,  x9,  [sp, #0x040]
+    ldp     x10, x11, [sp, #0x050]
+    ldp     x12, x13, [sp, #0x060]
+    ldp     x14, x15, [sp, #0x070]
+    ldp     x16, x17, [sp, #0x080]
+    ldp     x18, x19, [sp, #0x090]
 
-    ldr x29, [sp, #232]
-    ldr x30, [sp, #240]
+    ldp     x21, x22, [sp, #0x0A8]
+    ldp     x23, x24, [sp, #0x0B8]
+    ldp     x25, x26, [sp, #0x0C8]
+    ldp     x27, x28, [sp, #0x0D8]
 
-    // --------------------------------------------------------
-    // Destroy OLD exception frame.
-    // --------------------------------------------------------
-
-    add sp, sp, #288
-    add sp, sp, #16
-
-    // --------------------------------------------------------
-    // Switch to NEW task's stack.
-    // --------------------------------------------------------
-
-    mov sp, x20
+    ldr     x29, [sp, #0x0E8]
+    ldr     x30, [sp, #0x0F0]
 
     // --------------------------------------------------------
-    // Recover NEW task's x20.
+    // x20 currently contains the destination task SP.
+    //
+    // Remove the exception frame and saved x30 from the
+    // CURRENT stack, then switch to the TASK stack.
     // --------------------------------------------------------
 
-    mrs x20, tpidr_el1
+    add     sp, sp, #0x120
+    add     sp, sp, #0x010
+
+    mov     sp, x20
 
     // --------------------------------------------------------
-    // Return to NEW task.
+    // Finally restore the real x20.
     // --------------------------------------------------------
+
+    mrs     x20, tpidr_el1
 
     eret
+
+// ============================================================
+// Synchronous exception
+// ============================================================
+exception_sync_entry:
+str x30, [sp, #-16]!
+sub sp, sp, #288
+stp x0, x1, [sp, #0x000]
+stp x2, x3, [sp, #0x010]
+stp x4, x5, [sp, #0x020]
+stp x6, x7, [sp, #0x030]
+stp x8, x9, [sp, #0x040]
+stp x10, x11, [sp, #0x050]
+stp x12, x13, [sp, #0x060]
+stp x14, x15, [sp, #0x070]
+stp x16, x17, [sp, #0x080]
+stp x18, x19, [sp, #0x090]
+stp x20, x21, [sp, #0x0A0]
+stp x22, x23, [sp, #0x0B0]
+stp x24, x25, [sp, #0x0C0]
+stp x26, x27, [sp, #0x0D0]
+stp x28, x29, [sp, #0x0E0]
+ldr x1, [sp, #0x120]
+str x1, [sp, #0x0F0]
+add x1, sp, #0x130
+str x1, [sp, #0x0F8]
+mrs x1, elr_el1
+str x1, [sp, #0x100]
+mrs x1, spsr_el1
+str x1, [sp, #0x108]
+mrs x1, esr_el1
+str x1, [sp, #0x110]
+mrs x1, far_el1
+str x1, [sp, #0x118]
+mov x0, sp
+bl exception_sync_rust
+b exception_restore_context
 
 // ============================================================
 // IRQ exception
 // ============================================================
-
 exception_irq_entry:
-
-    // --------------------------------------------------------
-    // Preserve original x30.
-    // --------------------------------------------------------
-
-    str x30, [sp, #-16]!
-
-    // Allocate ExceptionFrame.
-    sub sp, sp, #288
-
-    // --------------------------------------------------------
-    // Save x0-x29
-    // --------------------------------------------------------
-
-    stp x0,  x1,  [sp, #0]
-    stp x2,  x3,  [sp, #16]
-    stp x4,  x5,  [sp, #32]
-    stp x6,  x7,  [sp, #48]
-    stp x8,  x9,  [sp, #64]
-    stp x10, x11, [sp, #80]
-    stp x12, x13, [sp, #96]
-    stp x14, x15, [sp, #112]
-    stp x16, x17, [sp, #128]
-    stp x18, x19, [sp, #144]
-    stp x20, x21, [sp, #160]
-    stp x22, x23, [sp, #176]
-    stp x24, x25, [sp, #192]
-    stp x26, x27, [sp, #208]
-    stp x28, x29, [sp, #224]
-
-    // --------------------------------------------------------
-    // Recover original x30.
-    // --------------------------------------------------------
-
-    ldr x1, [sp, #288]
-    str x1, [sp, #240]
-
-    // Original SP.
-    add x1, sp, #304
-    str x1, [sp, #248]
-
-    // ELR_EL1.
-    mrs x1, elr_el1
-    str x1, [sp, #256]
-
-    // SPSR_EL1.
-    mrs x1, spsr_el1
-    str x1, [sp, #264]
-
-    // ESR_EL1.
-    mrs x1, esr_el1
-    str x1, [sp, #272]
-
-    // FAR_EL1.
-    mrs x1, far_el1
-    str x1, [sp, #280]
-
-    // --------------------------------------------------------
-    // Read GIC interrupt acknowledge register.
-    //
-    // GICC base = 0x08010000
-    // GICC_IAR  = +0x0C
-    // --------------------------------------------------------
-
-    mov x2, #0x8010
-    lsl x2, x2, #12
-
-    ldr w19, [x2, #0x0C]
-
-    // --------------------------------------------------------
-    // exception_irq_rust(
-    //     &mut ExceptionFrame,
-    //     interrupt_id
-    // )
-    //
-    // x0 = frame
-    // w1 = interrupt ID
-    // --------------------------------------------------------
-
-    mov x0, sp
-    mov w1, w19
-
-    bl exception_irq_rust
-
-    // --------------------------------------------------------
-    // Rebuild GICC base.
-    // --------------------------------------------------------
-
-    mov x2, #0x8010
-    lsl x2, x2, #12
-
-    // --------------------------------------------------------
-    // Complete interrupt.
-    //
-    // GICC_EOIR = +0x10
-    // --------------------------------------------------------
-
-    str w19, [x2, #0x10]
-
-        // --------------------------------------------------------
-    // Rust may have replaced the frame with the NEXT task's
-    // context.
-    //
-    // We need the new SP while also restoring the new task's
-    // x20. Use TPIDR_EL1 as temporary storage so we don't
-    // touch the task's stack.
-    // --------------------------------------------------------
-
-    // Save the new task's x20 in TPIDR_EL1.
-    ldr x1, [sp, #160]
-    msr tpidr_el1, x1
-
-    // Save the new task's SP in x20.
-    ldr x20, [sp, #248]
-
-    // --------------------------------------------------------
-    // Restore ELR/SPSR.
-    // --------------------------------------------------------
-
-    ldr x1, [sp, #256]
-    msr elr_el1, x1
-
-    ldr x1, [sp, #264]
-    msr spsr_el1, x1
-
-    // --------------------------------------------------------
-    // Restore all general-purpose registers except x20.
-    // x20 currently contains the new task's SP.
-    // --------------------------------------------------------
-
-    ldp x0,  x1,  [sp, #0]
-    ldp x2,  x3,  [sp, #16]
-    ldp x4,  x5,  [sp, #32]
-    ldp x6,  x7,  [sp, #48]
-    ldp x8,  x9,  [sp, #64]
-    ldp x10, x11, [sp, #80]
-    ldp x12, x13, [sp, #96]
-    ldp x14, x15, [sp, #112]
-    ldp x16, x17, [sp, #128]
-    ldp x18, x19, [sp, #144]
-
-    // x20 intentionally skipped.
-
-    ldp x21, x22, [sp, #168]
-    ldp x23, x24, [sp, #184]
-    ldp x25, x26, [sp, #200]
-    ldp x27, x28, [sp, #216]
-
-    ldr x29, [sp, #232]
-    ldr x30, [sp, #240]
-
-    // --------------------------------------------------------
-    // Destroy the OLD exception frame.
-    // --------------------------------------------------------
-
-    add sp, sp, #288
-    add sp, sp, #16
-
-    // --------------------------------------------------------
-    // Switch to NEW task's stack.
-    // --------------------------------------------------------
-
-    mov sp, x20
-
-    // --------------------------------------------------------
-    // Recover the NEW task's x20.
-    // --------------------------------------------------------
-
-    mrs x20, tpidr_el1
-
-    // --------------------------------------------------------
-    // Return to NEW task.
-    // --------------------------------------------------------
-
-    eret
+str x30, [sp, #-16]!
+sub sp, sp, #288
+stp x0, x1, [sp, #0x000]
+stp x2, x3, [sp, #0x010]
+stp x4, x5, [sp, #0x020]
+stp x6, x7, [sp, #0x030]
+stp x8, x9, [sp, #0x040]
+stp x10, x11, [sp, #0x050]
+stp x12, x13, [sp, #0x060]
+stp x14, x15, [sp, #0x070]
+stp x16, x17, [sp, #0x080]
+stp x18, x19, [sp, #0x090]
+stp x20, x21, [sp, #0x0A0]
+stp x22, x23, [sp, #0x0B0]
+stp x24, x25, [sp, #0x0C0]
+stp x26, x27, [sp, #0x0D0]
+stp x28, x29, [sp, #0x0E0]
+ldr x1, [sp, #0x120]
+str x1, [sp, #0x0F0]
+add x1, sp, #0x130
+str x1, [sp, #0x0F8]
+mrs x1, elr_el1
+str x1, [sp, #0x100]
+mrs x1, spsr_el1
+str x1, [sp, #0x108]
+mrs x1, esr_el1
+str x1, [sp, #0x110]
+mrs x1, far_el1
+str x1, [sp, #0x118]
+mov x2, #0x8010
+lsl x2, x2, #12
+ldr w19, [x2, #0x0C]
+mov w1, w19
+mov x0, sp
+bl exception_irq_rust
+mov x2, #0x8010
+lsl x2, x2, #12
+str w19, [x2, #0x10]
+b exception_restore_context
 
 // ============================================================
 // FIQ exception
 // ============================================================
-
 exception_fiq_entry:
-
-    // Preserve original x30.
-    str x30, [sp, #-16]!
-
-    // Allocate ExceptionFrame.
-    sub sp, sp, #288
-
-    // Save x0-x29.
-    stp x0,  x1,  [sp, #0]
-    stp x2,  x3,  [sp, #16]
-    stp x4,  x5,  [sp, #32]
-    stp x6,  x7,  [sp, #48]
-    stp x8,  x9,  [sp, #64]
-    stp x10, x11, [sp, #80]
-    stp x12, x13, [sp, #96]
-    stp x14, x15, [sp, #112]
-    stp x16, x17, [sp, #128]
-    stp x18, x19, [sp, #144]
-    stp x20, x21, [sp, #160]
-    stp x22, x23, [sp, #176]
-    stp x24, x25, [sp, #192]
-    stp x26, x27, [sp, #208]
-    stp x28, x29, [sp, #224]
-
-    // Recover original x30.
-    ldr x1, [sp, #288]
-    str x1, [sp, #240]
-
-    // Original SP.
-    add x1, sp, #304
-    str x1, [sp, #248]
-
-    // ELR.
-    mrs x1, elr_el1
-    str x1, [sp, #256]
-
-    // SPSR.
-    mrs x1, spsr_el1
-    str x1, [sp, #264]
-
-    // ESR.
-    mrs x1, esr_el1
-    str x1, [sp, #272]
-
-    // FAR.
-    mrs x1, far_el1
-    str x1, [sp, #280]
-
-    // Call Rust.
-    mov x0, sp
-    bl exception_fiq_rust
-
-    // Restore ELR/SPSR.
-    ldr x1, [sp, #256]
-    msr elr_el1, x1
-
-    ldr x1, [sp, #264]
-    msr spsr_el1, x1
-
-    // Restore registers.
-    ldp x0,  x1,  [sp, #0]
-    ldp x2,  x3,  [sp, #16]
-    ldp x4,  x5,  [sp, #32]
-    ldp x6,  x7,  [sp, #48]
-    ldp x8,  x9,  [sp, #64]
-    ldp x10, x11, [sp, #80]
-    ldp x12, x13, [sp, #96]
-    ldp x14, x15, [sp, #112]
-    ldp x16, x17, [sp, #128]
-    ldp x18, x19, [sp, #144]
-    ldp x20, x21, [sp, #160]
-    ldp x22, x23, [sp, #176]
-    ldp x24, x25, [sp, #192]
-    ldp x26, x27, [sp, #208]
-    ldp x28, x29, [sp, #224]
-
-    // Restore x30.
-    ldr x30, [sp, #240]
-
-    // Destroy frame and temporary x30 storage.
-    add sp, sp, #288
-    add sp, sp, #16
-
-    eret
-
+str x30, [sp, #-16]!
+sub sp, sp, #288
+stp x0, x1, [sp, #0x000]
+stp x2, x3, [sp, #0x010]
+stp x4, x5, [sp, #0x020]
+stp x6, x7, [sp, #0x030]
+stp x8, x9, [sp, #0x040]
+stp x10, x11, [sp, #0x050]
+stp x12, x13, [sp, #0x060]
+stp x14, x15, [sp, #0x070]
+stp x16, x17, [sp, #0x080]
+stp x18, x19, [sp, #0x090]
+stp x20, x21, [sp, #0x0A0]
+stp x22, x23, [sp, #0x0B0]
+stp x24, x25, [sp, #0x0C0]
+stp x26, x27, [sp, #0x0D0]
+stp x28, x29, [sp, #0x0E0]
+ldr x1, [sp, #0x120]
+str x1, [sp, #0x0F0]
+add x1, sp, #0x130
+str x1, [sp, #0x0F8]
+mrs x1, elr_el1
+str x1, [sp, #0x100]
+mrs x1, spsr_el1
+str x1, [sp, #0x108]
+mrs x1, esr_el1
+str x1, [sp, #0x110]
+mrs x1, far_el1
+str x1, [sp, #0x118]
+mov x0, sp
+bl exception_fiq_rust
+b exception_restore_context
 
 // ============================================================
-// SError exception
+// SError
 // ============================================================
-
 exception_serror_entry:
-
-    bl exception_serror_rust
+bl exception_serror_rust
+b exception_serror_entry
