@@ -564,7 +564,27 @@ fn task_c() { // RAM test
             writeln!(uart, "FAIL: could not allocate RAM test page").unwrap();
         }
     }
+    writeln!(
+        uart,
+        "L0[0] = {:#018x}",
+        unsafe { PAGE_TABLE_L1.entries[1].0 }
+    ).unwrap();
 
+    writeln!(
+        uart,
+        "L1[0] = {:#018x}",
+        unsafe { PAGE_TABLE_L1.entries[0].0 }
+    ).unwrap();
+    writeln!(
+        uart,
+        "L2[0] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_RAM.entries[0].0 }
+    ).unwrap();
+    writeln!(
+        uart,
+        "L2[1] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_RAM.entries[1].0 }
+    ).unwrap();
     // ========================================================
     // Final state
     // ========================================================
@@ -826,22 +846,17 @@ impl Timer {
 
 const PAGE_SIZE: usize = 4096;
 const RAM_START: usize = 0x4000_0000;
-
 // Maximum RAM the allocator can manage.
 // 512 MiB.
 const MAX_RAM_END: usize = 0x6000_0000;
-
 const MAX_PAGE_COUNT: usize =
     (MAX_RAM_END - RAM_START) / PAGE_SIZE;
-
 const MAX_BITMAP_SIZE: usize =
     (MAX_PAGE_COUNT + 7) / 8;
-
 // One bit per physical page.
 #[unsafe(link_section = ".page_bitmap")]
 static mut PAGE_BITMAP: [u8; MAX_BITMAP_SIZE] =
     [0; MAX_BITMAP_SIZE];
-
 static mut RAM_END: usize = MAX_RAM_END;
 static mut KERNEL_END: usize = 0;
 static mut FIRST_FREE_PAGE: usize = 0;
@@ -973,6 +988,205 @@ fn free_page(address: usize) {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PageTableEntry(u64);
+impl PageTableEntry {
+    const fn invalid() -> Self {
+        Self(0)
+    }
+
+    const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    fn new_table(table: *const PageTable) -> Self {
+        let address = table as *const PageTable as u64;
+        Self(address | 0b11)
+    }
+
+    fn new_block(address: usize, attr_index: u64) -> Self {
+        Self(
+            (address as u64 & 0x0000_FFFF_FFE0_0000)
+                | 0b01                 // block descriptor
+                | (1 << 10)             // AF
+                | (attr_index << 2)     // AttrIndx
+        )
+    }
+}
+#[repr(C, align(4096))]
+struct PageTable {
+    entries: [PageTableEntry; 512]
+}
+impl PageTable {
+    const fn new() -> Self{
+        Self{entries : [PageTableEntry::invalid(); 512],}
+    }
+}
+static mut PAGE_TABLE_L0: PageTable = PageTable::new();
+static mut PAGE_TABLE_L1: PageTable = PageTable::new();
+static mut PAGE_TABLE_L2_RAM: PageTable = PageTable::new();
+static mut PAGE_TABLE_L2_DEVICE: PageTable = PageTable::new();
+const ATTR_NORMAL: u64 = 0;
+const ATTR_DEVICE: u64 = 1;
+fn init_mair() {
+    unsafe {
+        // Attr0 = Normal memory, Inner/Outer Write-Back,
+        // Read/Write Allocate
+        //
+        // Attr1 = Device-nGnRE
+        let mair: u64 =
+            0x04FF;
+
+        core::arch::asm!(
+            "msr mair_el1, {0}",
+            "isb",
+            in(reg) mair,
+        );
+    }
+}
+fn init_tcr() {
+    unsafe {
+        // T0SZ = 25 -> 39-bit VA space
+        // TG0  = 00 -> 4 KiB granules
+        // SH0  = 11 -> Inner Shareable
+        // IRGN0/ORGN0 = 01 -> Write-back, Read/Write allocate
+        // IPS = 010 -> 40-bit physical address space
+        let tcr: u64 =
+            (25 << 0)  |   // T0SZ
+            (0b01 << 8) |   // IRGN0
+            (0b01 << 10) |  // ORGN0
+            (0b11 << 12) |  // SH0
+            (0b010 << 32);  // IPS = 40-bit
+
+        core::arch::asm!(
+            "msr tcr_el1, {0}",
+            "isb",
+            in(reg) tcr,
+        );
+    }
+}
+fn init_ttbr0() {
+    unsafe {
+        let l0 =
+            &raw const PAGE_TABLE_L0 as *const _ as u64;
+
+        core::arch::asm!(
+            "msr ttbr0_el1, {0}",
+            "dsb sy",
+            "isb",
+            in(reg) l0,
+        );
+    }
+}
+fn enable_mmu() {
+    unsafe {
+        let mut sctlr: u64;
+
+        core::arch::asm!(
+            "mrs {0}, sctlr_el1",
+            out(reg) sctlr,
+        );
+
+        sctlr |= 1 << 0;      // M = 1
+        sctlr &= !(1 << 2);   // C = 0
+        sctlr &= !(1 << 12);  // I = 0
+
+        // Don't do anything fancy yet.
+        core::arch::asm!(
+            "msr sctlr_el1, {0}",
+            in(reg) sctlr,
+        );
+
+        // This executes only if the MSR returned.
+        core::arch::asm!("nop");
+
+        // Synchronise execution after changing SCTLR.
+        core::arch::asm!("isb");
+    }
+}
+unsafe fn test_page_table() {
+    // --------------------------------------------------------
+    // L0
+    // --------------------------------------------------------
+
+    PAGE_TABLE_L0.entries[0] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L1);
+
+    // --------------------------------------------------------
+    // L1
+    //
+    // 0x0000_0000 - 0x3FFF_FFFF
+    //  -> L2 RAM
+    //
+    // 0x4000_0000 - 0x7FFF_FFFF
+    //  -> L2 RAM
+    //
+    // 0x0800_0000 is actually inside the first L1 region,
+    // so give it its own L2 table if we want precise mapping.
+    // --------------------------------------------------------
+
+    PAGE_TABLE_L1.entries[0] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_DEVICE);
+
+    PAGE_TABLE_L1.entries[1] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_RAM);
+
+    // --------------------------------------------------------
+    // UART / device mappings
+    //
+    // L1[0] covers 0x0000_0000 - 0x3FFF_FFFF.
+    //
+    // L2 index:
+    //
+    // 0x0900_0000 / 0x20_0000 = 72
+    // --------------------------------------------------------
+
+    PAGE_TABLE_L2_DEVICE.entries[72] =
+        PageTableEntry::new_block(
+            0x0900_0000,
+            1,
+        );
+
+    // GIC distributor: 0x0800_0000
+    PAGE_TABLE_L2_DEVICE.entries[64] =
+        PageTableEntry::new_block(
+            0x0800_0000,
+            1,
+        );
+
+    // GIC CPU interface: 0x0801_0000
+    //
+    // It lies in the same 2 MiB block as 0x0800_0000,
+    // so the block beginning at 0x0800_0000 covers both.
+    
+    // --------------------------------------------------------
+    // RAM mappings
+    //
+    // L1[1] covers:
+    //
+    // 0x4000_0000 - 0x7FFF_FFFF
+    //
+    // L2[0] = 0x4000_0000
+    // L2[1] = 0x4020_0000
+    // --------------------------------------------------------
+
+    PAGE_TABLE_L2_RAM.entries[0] =
+        PageTableEntry::new_block(
+            0x4000_0000,
+            0,
+        );
+
+    PAGE_TABLE_L2_RAM.entries[1] =
+        PageTableEntry::new_block(
+            0x4020_0000,
+            0,
+        );
+}
 // ============================================================
 // Exception decoding
 // ============================================================
@@ -1184,9 +1398,117 @@ pub extern "C" fn rust_start() -> ! {
         );
     }
     writeln!(uart, "Enabled FP/SIMD!").unwrap();
+    writeln!(uart, "Installing exception vector....").unwrap();
+    unsafe {
+        let vector = exception_vector as *const ();
+        core::arch::asm!(
+            "msr VBAR_EL1, {}",
+            "isb",
+            in(reg) vector,
+        );
+    }
+    writeln!(uart, "Vector installed!").unwrap();
     writeln!(uart, "Initialising memory allocator").unwrap();
     init_memory();
     writeln!(uart, "Memory allocator initialised!").unwrap();
+    writeln!(uart, "Initialising MMU...").unwrap();
+    unsafe{test_page_table();}
+    writeln!(
+        uart,
+        "L2 RAM[0] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_RAM.entries[0].0 }
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "L2 RAM[1] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_RAM.entries[1].0 }
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "L2 DEVICE[64] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_DEVICE.entries[64].0 }
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "L2 DEVICE[72] = {:#018x}",
+        unsafe { PAGE_TABLE_L2_DEVICE.entries[72].0 }
+    ).unwrap();
+    writeln!(uart, "Page tables configured!").unwrap();
+    init_mair();
+    writeln!(uart, "MAIR configured!").unwrap();
+    init_tcr();
+    writeln!(uart, "TCR configured!").unwrap();
+    init_ttbr0();
+    writeln!(uart, "TTBR0 configured!").unwrap();
+    unsafe {
+        let tcr: u64;
+        let ttbr0: u64;
+        let mair: u64;
+        let sctlr: u64;
+
+        core::arch::asm!(
+            "mrs {0}, tcr_el1",
+            "mrs {1}, ttbr0_el1",
+            "mrs {2}, mair_el1",
+            "mrs {3}, sctlr_el1",
+            out(reg) tcr,
+            out(reg) ttbr0,
+            out(reg) mair,
+            out(reg) sctlr,
+        );
+
+        writeln!(uart, "TCR  = {:#018x}", tcr).unwrap();
+        writeln!(uart, "TTBR0 = {:#018x}", ttbr0).unwrap();
+        writeln!(uart, "MAIR = {:#018x}", mair).unwrap();
+        writeln!(uart, "SCTLR = {:#018x}", sctlr).unwrap();
+    }
+    writeln!(
+        uart,
+        "rust_start = {:#018x}",
+        rust_start as usize
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "exception_vector = {:#018x}",
+        exception_vector as usize
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "_kernel_start = {:#018x}",
+        unsafe { &_kernel_start as *const u8 as usize }
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "_kernel_end = {:#018x}",
+        unsafe { &_kernel_end as *const u8 as usize }
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "STACK = {:#018x}",
+        &raw const STACK as *const _ as usize
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "PAGE_TABLE_L0 = {:#018x}",
+        &raw const PAGE_TABLE_L0 as *const _ as usize
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "SCHEDULER = {:#018x}",
+        &raw const SCHEDULER as *const _ as usize
+    ).unwrap();
+    writeln!(uart, "Enabling MMU...").unwrap();
+    enable_mmu();
+    writeln!(uart, "MMU enabled!").unwrap();
     writeln!(uart, "Initialising scheduler...").unwrap();
     unsafe {
         let scheduler = &raw mut SCHEDULER;
@@ -1199,16 +1521,6 @@ pub extern "C" fn rust_start() -> ! {
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
-    writeln!(uart, "Installing exception vector....").unwrap();
-    unsafe {
-        let vector = exception_vector as *const ();
-        core::arch::asm!(
-            "msr VBAR_EL1, {}",
-            "isb",
-            in(reg) vector,
-        );
-    }
-    writeln!(uart, "Vector installed!").unwrap();
     writeln!(uart, "Enabling GIC...").unwrap();
     let gic = Gic::new();
     gic.enable();
