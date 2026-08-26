@@ -226,24 +226,358 @@ fn task_b() {
     }
     }
 fn task_c() { // RAM test
+    unsafe{
     let mut uart = Uart::new(0x0900_0000);
-    writeln!(uart, "Checking RAM...").unwrap();
-    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap(); 
-    writeln!(uart, "RAM_START: {}", RAM_START).unwrap();
-    writeln!(uart, "RAM_END: {}", RAM_END).unwrap();
-    writeln!(uart, "KERNEL_END: {}", KERNEL_END).unwrap();
-    writeln!(uart, "FIRST_FREE_PAGE: {}", FIRST_FREE_PAGE).unwrap();
-    writeln!(uart, "PAGE_COUNT: {}", PAGE_COUNT).unwrap();
-    writeln!(uart, "BITMAP_SIZE: {}", BITMAP_SIZE).unwrap();
-    writeln!(uart, "Executing page test...").unwrap();
-    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
-    writeln!(uart, "Marking as used").unwrap();
+
+    writeln!(uart, "================================").unwrap();
+    writeln!(uart, "        RAM / PAGE TEST         ").unwrap();
+    writeln!(uart, "================================").unwrap();
+    let ram_end = core::ptr::addr_of!(RAM_END).read();
+    let kernel_end = core::ptr::addr_of!(KERNEL_END).read();
+    let first_free_page = core::ptr::addr_of!(FIRST_FREE_PAGE).read();
+    let page_count = core::ptr::addr_of!(PAGE_COUNT).read();
+    let bitmap_size = core::ptr::addr_of!(BITMAP_SIZE).read();
+    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap();
+    writeln!(uart, "RAM_START: {:#x}", RAM_START).unwrap();
+    writeln!(uart, "RAM_END: {:#x}", ram_end).unwrap();
+    writeln!(uart, "KERNEL_END: {:#x}", kernel_end).unwrap();
+    writeln!(uart, "FIRST_FREE_PAGE: {:#x}", first_free_page).unwrap();
+    writeln!(uart, "PAGE_COUNT: {}", page_count).unwrap();
+    writeln!(uart, "BITMAP_SIZE: {}", bitmap_size).unwrap();
+
+
+    // ========================================================
+    // Basic bitmap test
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing page bitmap...").unwrap();
+
+    let mut bitmap_passed = true;
+
+    // Page 0 should initially be free.
+    if is_page_used(0) {
+        writeln!(uart, "FAIL: page 0 starts used").unwrap();
+        bitmap_passed = false;
+    }
+
+    // Mark page 0 used.
     mark_page_used(0);
-    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
-    writeln!(uart, "Marking as unused").unwrap();
+
+    if !is_page_used(0) {
+        writeln!(uart, "FAIL: page 0 was not marked used").unwrap();
+        bitmap_passed = false;
+    }
+
+    // Mark page 0 free again.
     mark_page_free(0);
-    writeln!(uart, "Is page 0 used? {}", is_page_used(0)).unwrap();
-    writeln!(uart, "RAM tested!").unwrap();
+
+    if is_page_used(0) {
+        writeln!(uart, "FAIL: page 0 was not marked free").unwrap();
+        bitmap_passed = false;
+    }
+
+    // Test the boundary between bitmap bytes.
+    mark_page_used(7);
+    mark_page_used(8);
+
+    if is_page_used(6) {
+        writeln!(uart, "FAIL: page 6 incorrectly marked used").unwrap();
+        bitmap_passed = false;
+    }
+
+    if !is_page_used(7) {
+        writeln!(uart, "FAIL: page 7 was not marked used").unwrap();
+        bitmap_passed = false;
+    }
+
+    if !is_page_used(8) {
+        writeln!(uart, "FAIL: page 8 was not marked used").unwrap();
+        bitmap_passed = false;
+    }
+
+    if is_page_used(9) {
+        writeln!(uart, "FAIL: page 9 incorrectly marked used").unwrap();
+        bitmap_passed = false;
+    }
+
+    // Clean up.
+    mark_page_free(7);
+    mark_page_free(8);
+
+    if bitmap_passed {
+        writeln!(uart, "PASS: page bitmap").unwrap();
+    } else {
+        writeln!(uart, "FAIL: page bitmap").unwrap();
+    }
+
+    // ========================================================
+    // Single page allocation
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing single page allocation...").unwrap();
+
+    let first_page = alloc_page();
+
+    match first_page {
+        Some(addr) => {
+            writeln!(uart, "Allocated page: {:#x}", addr).unwrap();
+
+            let expected = FIRST_FREE_PAGE;
+
+            if addr == expected {
+                writeln!(uart, "PASS: first page address").unwrap();
+            } else {
+                writeln!(
+                    uart,
+                    "FAIL: expected {:#x}, got {:#x}",
+                    expected,
+                    addr
+                )
+                .unwrap();
+            }
+
+            let page = (addr - FIRST_FREE_PAGE) / PAGE_SIZE;
+
+            if is_page_used(page) {
+                writeln!(uart, "PASS: allocated page marked used").unwrap();
+            } else {
+                writeln!(uart, "FAIL: allocated page still free").unwrap();
+            }
+
+            free_page(addr);
+
+            if !is_page_used(page) {
+                writeln!(uart, "PASS: freed page marked free").unwrap();
+            } else {
+                writeln!(uart, "FAIL: freed page still used").unwrap();
+            }
+        }
+
+        None => {
+            writeln!(uart, "FAIL: could not allocate page").unwrap();
+        }
+    }
+
+    // ========================================================
+    // Multiple page allocation
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing multiple page allocation...").unwrap();
+
+    let a = alloc_page();
+    let b = alloc_page();
+    let c = alloc_page();
+
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => {
+            writeln!(uart, "Page A: {:#x}", a).unwrap();
+            writeln!(uart, "Page B: {:#x}", b).unwrap();
+            writeln!(uart, "Page C: {:#x}", c).unwrap();
+
+            let mut passed = true;
+
+            if a == b {
+                writeln!(uart, "FAIL: A == B").unwrap();
+                passed = false;
+            }
+
+            if a == c {
+                writeln!(uart, "FAIL: A == C").unwrap();
+                passed = false;
+            }
+
+            if b == c {
+                writeln!(uart, "FAIL: B == C").unwrap();
+                passed = false;
+            }
+
+            if passed {
+                writeln!(uart, "PASS: allocations are unique").unwrap();
+            }
+
+            free_page(a);
+            free_page(b);
+            free_page(c);
+
+            writeln!(uart, "Freed A, B, C").unwrap();
+        }
+
+        _ => {
+            writeln!(uart, "FAIL: could not allocate three pages").unwrap();
+
+            if let Some(addr) = a {
+                free_page(addr);
+            }
+
+            if let Some(addr) = b {
+                free_page(addr);
+            }
+
+            if let Some(addr) = c {
+                free_page(addr);
+            }
+        }
+    }
+
+    // ========================================================
+    // Reuse freed page
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing page reuse...").unwrap();
+
+    let a = alloc_page();
+
+    match a {
+        Some(a) => {
+            writeln!(uart, "First allocation: {:#x}", a).unwrap();
+
+            free_page(a);
+
+            writeln!(uart, "Freed page").unwrap();
+
+            let b = alloc_page();
+
+            match b {
+                Some(b) => {
+                    writeln!(uart, "Second allocation: {:#x}", b).unwrap();
+
+                    if a == b {
+                        writeln!(uart, "PASS: freed page was reused").unwrap();
+                    } else {
+                        writeln!(
+                            uart,
+                            "FAIL: expected {:#x}, got {:#x}",
+                            a,
+                            b
+                        )
+                        .unwrap();
+                    }
+
+                    free_page(b);
+                }
+
+                None => {
+                    writeln!(uart, "FAIL: could not reallocate page").unwrap();
+                }
+            }
+        }
+
+        None => {
+            writeln!(uart, "FAIL: initial allocation failed").unwrap();
+        }
+    }
+
+    // ========================================================
+    // Actual RAM access
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing actual RAM access...").unwrap();
+
+    let page = alloc_page();
+
+    match page {
+        Some(addr) => {
+            writeln!(uart, "Allocated test page: {:#x}", addr).unwrap();
+
+            let ptr = addr as *mut u8;
+
+            // Write a pattern across the entire page.
+            unsafe {
+                for i in 0..PAGE_SIZE {
+                    ptr.add(i).write_volatile(0xAA);
+                }
+            }
+
+            writeln!(uart, "Wrote 0xAA to entire page").unwrap();
+
+            let mut passed = true;
+
+            // Read the entire page back.
+            unsafe {
+                for i in 0..PAGE_SIZE {
+                    let value = ptr.add(i).read_volatile();
+
+                    if value != 0xAA {
+                        writeln!(
+                            uart,
+                            "FAIL: byte {} = {:#x}",
+                            i,
+                            value
+                        )
+                        .unwrap();
+
+                        passed = false;
+                        break;
+                    }
+                }
+            }
+
+            if passed {
+                writeln!(uart, "PASS: entire page read back correctly").unwrap();
+            }
+
+            // Test a second pattern.
+            unsafe {
+                for i in 0..PAGE_SIZE {
+                    ptr.add(i).write_volatile(0x55);
+                }
+            }
+
+            writeln!(uart, "Wrote 0x55 to entire page").unwrap();
+
+            let mut passed = true;
+
+            unsafe {
+                for i in 0..PAGE_SIZE {
+                    let value = ptr.add(i).read_volatile();
+
+                    if value != 0x55 {
+                        writeln!(
+                            uart,
+                            "FAIL: byte {} = {:#x}",
+                            i,
+                            value
+                        )
+                        .unwrap();
+
+                        passed = false;
+                        break;
+                    }
+                }
+            }
+
+            if passed {
+                writeln!(uart, "PASS: second RAM pattern").unwrap();
+            }
+
+            free_page(addr);
+
+            writeln!(uart, "Test page freed").unwrap();
+        }
+
+        None => {
+            writeln!(uart, "FAIL: could not allocate RAM test page").unwrap();
+        }
+    }
+
+    // ========================================================
+    // Final state
+    // ========================================================
+
+    writeln!(uart, "").unwrap();
+    writeln!(uart, "================================").unwrap();
+    writeln!(uart, "          RAM TESTED            ").unwrap();
+    writeln!(uart, "================================").unwrap();
+
+    loop {
+        yield_now();
+    }
+    }
 }
 // ============================================================
 // Idle
@@ -486,52 +820,156 @@ impl Timer {
     }
 }
 
-//RAM
+// ============================================================
+// RAM / Physical Page Allocator
+// ============================================================
 
-const PAGE_SIZE: usize = 4096; //4KiB
+const PAGE_SIZE: usize = 4096;
 const RAM_START: usize = 0x4000_0000;
-const RAM_END: usize = 0x6000_0000;
-const KERNEL_END: usize = 0x4000_C000;
-const FIRST_FREE_PAGE: usize = KERNEL_END;
-const PAGE_COUNT: usize = (RAM_END - FIRST_FREE_PAGE) / PAGE_SIZE;
-const BITMAP_SIZE: usize = (PAGE_COUNT + 7) / 8;
-static mut PAGE_BITMAP: [u8; BITMAP_SIZE] = [0; BITMAP_SIZE];
-unsafe extern "C"{
+
+// Maximum RAM the allocator can manage.
+// 512 MiB.
+const MAX_RAM_END: usize = 0x6000_0000;
+
+const MAX_PAGE_COUNT: usize =
+    (MAX_RAM_END - RAM_START) / PAGE_SIZE;
+
+const MAX_BITMAP_SIZE: usize =
+    (MAX_PAGE_COUNT + 7) / 8;
+
+// One bit per physical page.
+#[unsafe(link_section = ".page_bitmap")]
+static mut PAGE_BITMAP: [u8; MAX_BITMAP_SIZE] =
+    [0; MAX_BITMAP_SIZE];
+
+static mut RAM_END: usize = MAX_RAM_END;
+static mut KERNEL_END: usize = 0;
+static mut FIRST_FREE_PAGE: usize = 0;
+static mut PAGE_COUNT: usize = 0;
+static mut BITMAP_SIZE: usize = 0;
+
+unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
 }
-fn kernel_ram_helper(){
-    let mut uart = Uart::new(0x0900_0000);
-    let start = unsafe { &_kernel_start as *const u8 as usize};
-    let end = unsafe { &_kernel_end as *const u8 as usize};
-    writeln!(uart, "KERNEL START = {:#018x}", start).ok();
-    writeln!(uart, "KERNEL END = {:#018x}", end).ok();
+
+// ------------------------------------------------------------
+// Initialisation
+// ------------------------------------------------------------
+
+fn init_memory() {
+    unsafe {
+        KERNEL_END = &_kernel_end as *const u8 as usize;
+
+        FIRST_FREE_PAGE =
+            (KERNEL_END + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        PAGE_COUNT =
+            (RAM_END - FIRST_FREE_PAGE) / PAGE_SIZE;
+
+        BITMAP_SIZE =
+            (PAGE_COUNT + 7) / 8;
+
+        // Start with every page free.
+        let bitmap_ptr = core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
+
+        for i in 0..BITMAP_SIZE {
+            bitmap_ptr.add(i).write(0);
+        }
+    }
 }
+
+// ------------------------------------------------------------
+// Bitmap operations
+// ------------------------------------------------------------
+
 fn is_page_used(page: usize) -> bool {
-    let byte = page / 8;
-    let bit = page % 8;
-    let mask = 1u8 << bit;
-
     unsafe {
-        (PAGE_BITMAP[byte] & mask) != 0
+        assert!(page < PAGE_COUNT);
+
+        let byte = page / 8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+
+        let bitmap_ptr =
+            core::ptr::addr_of!(PAGE_BITMAP) as *const u8;
+
+        (bitmap_ptr.add(byte).read() & mask) != 0
     }
 }
+
 fn mark_page_used(page: usize) {
-    let byte = page / 8;
-    let bit = page % 8;
-    let mask = 1u8 << bit;
-
     unsafe {
-        PAGE_BITMAP[byte] |= mask;
+        assert!(page < PAGE_COUNT);
+
+        let byte = page / 8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+
+        let bitmap_ptr =
+            core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
+
+        let ptr = bitmap_ptr.add(byte);
+
+        *ptr |= mask;
     }
 }
-fn mark_page_free(page: usize) {
-    let byte = page / 8;
-    let bit = page % 8;
-    let mask = 1u8 << bit;
 
+fn mark_page_free(page: usize) {
     unsafe {
-        PAGE_BITMAP[byte] &= !mask;
+        assert!(page < PAGE_COUNT);
+
+        let byte = page / 8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+
+        let bitmap_ptr =
+            core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
+
+        let ptr = bitmap_ptr.add(byte);
+
+        *ptr &= !mask;
+    }
+}
+
+// ------------------------------------------------------------
+// Allocate one physical page
+// ------------------------------------------------------------
+
+fn alloc_page() -> Option<usize> {
+    unsafe {
+        for page in 0..PAGE_COUNT {
+            if !is_page_used(page) {
+                mark_page_used(page);
+
+                let address =
+                    FIRST_FREE_PAGE + page * PAGE_SIZE;
+
+                return Some(address);
+            }
+        }
+    }
+
+    None
+}
+
+// ------------------------------------------------------------
+// Free one physical page
+// ------------------------------------------------------------
+
+fn free_page(address: usize) {
+    unsafe {
+        assert!(address >= FIRST_FREE_PAGE);
+        assert!(address < RAM_END);
+        assert!(address % PAGE_SIZE == 0);
+
+        let page =
+            (address - FIRST_FREE_PAGE) / PAGE_SIZE;
+
+        assert!(page < PAGE_COUNT);
+        assert!(is_page_used(page));
+
+        mark_page_free(page);
     }
 }
 
@@ -689,19 +1127,19 @@ extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32) 
             scheduler.tick(frame);
             let mut uart = Uart::new(0x0900_0000);
             if scheduler.current != 0 {
-            writeln!(
-                uart,
-                "TICK {} -> TASK {} frame_pc={:#018x} saved_pc={:#018x} SP={:#018x}",
-                tick,
-                scheduler.current,
-                frame.elr,
-                scheduler.tasks.tasks[scheduler.current]
-                    .as_ref()
-                    .map(|t| t.context.pc)
-                    .unwrap_or(0),
-                frame.sp,
-            )
-            .ok();
+            //writeln!(
+            //    uart,
+            //    "TICK {} -> TASK {} frame_pc={:#018x} saved_pc={:#018x} SP={:#018x}",
+            //   tick,
+            //   scheduler.current,
+            //    frame.elr,
+            //    scheduler.tasks.tasks[scheduler.current]
+            //        .as_ref()
+            //         .map(|t| t.context.pc)
+            //        .unwrap_or(0),
+            //     frame.sp,
+            //  )
+            // .ok();
         }
         }
     }
@@ -746,6 +1184,9 @@ pub extern "C" fn rust_start() -> ! {
         );
     }
     writeln!(uart, "Enabled FP/SIMD!").unwrap();
+    writeln!(uart, "Initialising memory allocator").unwrap();
+    init_memory();
+    writeln!(uart, "Memory allocator initialised!").unwrap();
     writeln!(uart, "Initialising scheduler...").unwrap();
     unsafe {
         let scheduler = &raw mut SCHEDULER;
@@ -784,7 +1225,7 @@ pub extern "C" fn rust_start() -> ! {
         core::arch::asm!("msr daifclr, #2");
     }
     writeln!(uart, "CPU IRQs enabled!").unwrap();
-    writeln!(uart, "Calling WFE...").unwrap();
+    writeln!(uart, "Scheduler has crashed! Loading to wfe").unwrap();
     loop {
         unsafe {
             core::arch::asm!("wfe");
