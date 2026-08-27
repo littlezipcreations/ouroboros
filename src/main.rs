@@ -447,6 +447,96 @@ fn task_c() { //RAM test
                 }
             }
         }
+        writeln!(uart, "").unwrap();
+    writeln!(uart, "Testing multiple virtual page mappings...").unwrap();
+
+    let physical_a = alloc_page();
+    let physical_b = alloc_page();
+    let physical_c = alloc_page();
+
+    match (physical_a, physical_b, physical_c) {
+        (Some(a), Some(b), Some(c)) => {
+            let virtual_a = 0x8000_3000usize;
+            let virtual_b = 0x8000_4000usize;
+            let virtual_c = 0x8000_5000usize;
+
+            writeln!(uart, "Physical A: {:#x}", a).unwrap();
+            writeln!(uart, "Physical B: {:#x}", b).unwrap();
+            writeln!(uart, "Physical C: {:#x}", c).unwrap();
+
+            unsafe {
+                map_page(virtual_a, a);
+                map_page(virtual_b, b);
+                map_page(virtual_c, c);
+            }
+
+            writeln!(
+                uart,
+                "Mapped {:#x} -> {:#x}",
+                virtual_a,
+                a
+            ).unwrap();
+
+            writeln!(
+                uart,
+                "Mapped {:#x} -> {:#x}",
+                virtual_b,
+                b
+            ).unwrap();
+
+            writeln!(
+                uart,
+                "Mapped {:#x} -> {:#x}",
+                virtual_c,
+                c
+            ).unwrap();
+
+            unsafe {
+                (virtual_a as *mut u64).write_volatile(0x1111_1111_1111_1111);
+                (virtual_b as *mut u64).write_volatile(0x2222_2222_2222_2222);
+                (virtual_c as *mut u64).write_volatile(0x3333_3333_3333_3333);
+
+                let value_a = (virtual_a as *const u64).read_volatile();
+                let value_b = (virtual_b as *const u64).read_volatile();
+                let value_c = (virtual_c as *const u64).read_volatile();
+
+                writeln!(uart, "VA A read: {:#018x}", value_a).unwrap();
+                writeln!(uart, "VA B read: {:#018x}", value_b).unwrap();
+                writeln!(uart, "VA C read: {:#018x}", value_c).unwrap();
+
+                if value_a == 0x1111_1111_1111_1111
+                    && value_b == 0x2222_2222_2222_2222
+                    && value_c == 0x3333_3333_3333_3333
+                {
+                    writeln!(uart, "PASS: multiple virtual mappings").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: multiple virtual mappings").unwrap();
+                }
+            }
+
+            free_page(a);
+            free_page(b);
+            free_page(c);
+
+            writeln!(uart, "Physical pages freed").unwrap();
+        }
+
+        _ => {
+            writeln!(uart, "FAIL: could not allocate three pages").unwrap();
+
+            if let Some(a) = physical_a {
+                free_page(a);
+            }
+
+            if let Some(b) = physical_b {
+                free_page(b);
+            }
+
+            if let Some(c) = physical_c {
+                free_page(c);
+            }
+        }
+}
         writeln!(uart, "================================").unwrap();
         writeln!(uart, "          RAM TESTED            ").unwrap();
         writeln!(uart, "================================").unwrap();
