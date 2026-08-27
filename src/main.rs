@@ -50,24 +50,20 @@ struct KernelStack([u8; 16 * 1024]);
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".kernel_stack")]
 static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
-
 // ============================================================
 // Tasks
 // ============================================================
-
 const TASK_STACK_SIZE: usize = 16 * 1024;
 const MAX_TASKS: usize = 4;
-
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskState {
     Ready,
     Running,
     Dead,
-    Unused, 
+    Unused,
     Blocked,
 }
-
 #[repr(C)]
 struct CpuContext {
     x: [u64; 31],
@@ -75,44 +71,33 @@ struct CpuContext {
     pc: u64,
     spsr: u64,
 }
-
 #[repr(C)]
 struct Task {
     id: usize,
     state: TaskState,
     context: CpuContext,
 }
-
 const SPSR_EL1H: u64 = 0b0101;
-
-// Each task gets a permanently located stack.
-// These never move, so pointers into them remain valid.
 #[repr(align(16))]
 #[derive(Copy, Clone)]
 struct TaskStack([u8; TASK_STACK_SIZE]);
-
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".task_stacks")]
 static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
     [TaskStack([0; TASK_STACK_SIZE]); MAX_TASKS];
-
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         let stack_bottom;
         let stack_top;
-
         unsafe {
             stack_bottom = TASK_STACKS[id].0.as_ptr() as u64;
             stack_top = stack_bottom + TASK_STACK_SIZE as u64;
         }
-
         let stack_top = stack_top & !0xF;
         let initial_sp = stack_top - 16;
-
         let mut task = Self {
             id,
             state: TaskState::Ready,
-
             context: CpuContext {
                 x: [0; 31],
                 sp: initial_sp,
@@ -120,14 +105,9 @@ impl Task {
                 spsr: SPSR_EL1H,
             },
         };
-
-        // x0 = entry function
         task.context.x[0] = entry as usize as u64;
-
-        // Return from task_trampoline -> task_exit
         task.context.x[30] = task_exit as usize as u64;
-        task.context.x[1..].fill(0); //Make sure it actually is ALL ZEROS!
-
+        task.context.x[1..].fill(0);
         task
     }
     fn save_context(&mut self, frame: &ExceptionFrame) {
@@ -136,7 +116,6 @@ impl Task {
         self.context.pc = frame.elr;
         self.context.spsr = frame.spsr;
     }
-
     fn load_context(&self, frame: &mut ExceptionFrame) {
         frame.x.copy_from_slice(&self.context.x);
         frame.sp = self.context.sp;
@@ -144,12 +123,10 @@ impl Task {
         frame.spsr = self.context.spsr;
     }
 }
-
 struct TaskTable {
     tasks: [Option<Task>; MAX_TASKS],
     count: usize,
 }
-
 impl TaskTable {
     fn new() -> Self {
         Self {
@@ -157,31 +134,23 @@ impl TaskTable {
             count: 0,
         }
     }
-
     fn create(&mut self, entry: fn()) -> usize {
         if self.count >= MAX_TASKS {
             panic!("No free task slots");
         }
-
         let id = self.count;
-
         self.tasks[id] = Some(Task::new(id, entry));
-
         self.count += 1;
-
         id
     }
 }
-
 // ============================================================
 // Task trampoline / termination
 // ============================================================
-
 fn task_trampoline(entry: fn()) -> ! {
     entry();
     task_exit()
 }
-
 fn task_exit() -> ! {
     unsafe {
         core::arch::asm!("svc #1");
@@ -190,413 +159,260 @@ fn task_exit() -> ! {
         core::hint::spin_loop();
     }
 }
-
 fn yield_now() {
     unsafe {
         core::arch::asm!("svc #2", options(nomem, nostack));
     }
 }
-
 // ============================================================
 // Test tasks
 // ============================================================
-
 fn task_a() {
     let mut uart = Uart::new(0x0900_0000);
-    let mut A = 0u64;
-    loop{
-        for _ in 0..500_000{ core::hint::spin_loop();}
-        unsafe {
-            A = A.wrapping_add(1);
-            writeln!(uart, "A value = {:#x}", A);
+    let mut a = 0u64;
+    loop {
+        for _ in 0..500_000 {
+            core::hint::spin_loop();
         }
-        if A == 100u64{task_exit();}
+        a = a.wrapping_add(1);
+        writeln!(uart, "A value = {:#x}", a).ok();
+        if a == 100 {
+            task_exit();
+        }
     }
 }
 fn task_b() {
     let mut uart = Uart::new(0x0900_0000);
-    let mut B = 1000u64;
-    loop{
-        for _ in 0..500_000{core::hint::spin_loop();}
-        unsafe{
-            B = B.wrapping_add(1);
-            writeln!(uart, "B value = {:#x}", B);
+    let mut b = 1000u64;
+    loop {
+        for _ in 0..500_000 {
+            core::hint::spin_loop();
         }
-        if B == 2000u64{task_exit();}
-    }
-    }
-fn task_c() { // RAM test
-    unsafe{
-    let mut uart = Uart::new(0x0900_0000);
-
-    writeln!(uart, "================================").unwrap();
-    writeln!(uart, "        RAM / PAGE TEST         ").unwrap();
-    writeln!(uart, "================================").unwrap();
-    let ram_end = core::ptr::addr_of!(RAM_END).read();
-    let kernel_end = core::ptr::addr_of!(KERNEL_END).read();
-    let first_free_page = core::ptr::addr_of!(FIRST_FREE_PAGE).read();
-    let page_count = core::ptr::addr_of!(PAGE_COUNT).read();
-    let bitmap_size = core::ptr::addr_of!(BITMAP_SIZE).read();
-    writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap();
-    writeln!(uart, "RAM_START: {:#x}", RAM_START).unwrap();
-    writeln!(uart, "RAM_END: {:#x}", ram_end).unwrap();
-    writeln!(uart, "KERNEL_END: {:#x}", kernel_end).unwrap();
-    writeln!(uart, "FIRST_FREE_PAGE: {:#x}", first_free_page).unwrap();
-    writeln!(uart, "PAGE_COUNT: {}", page_count).unwrap();
-    writeln!(uart, "BITMAP_SIZE: {}", bitmap_size).unwrap();
-
-
-    // ========================================================
-    // Basic bitmap test
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing page bitmap...").unwrap();
-
-    let mut bitmap_passed = true;
-
-    // Page 0 should initially be free.
-    if is_page_used(0) {
-        writeln!(uart, "FAIL: page 0 starts used").unwrap();
-        bitmap_passed = false;
-    }
-
-    // Mark page 0 used.
-    mark_page_used(0);
-
-    if !is_page_used(0) {
-        writeln!(uart, "FAIL: page 0 was not marked used").unwrap();
-        bitmap_passed = false;
-    }
-
-    // Mark page 0 free again.
-    mark_page_free(0);
-
-    if is_page_used(0) {
-        writeln!(uart, "FAIL: page 0 was not marked free").unwrap();
-        bitmap_passed = false;
-    }
-
-    // Test the boundary between bitmap bytes.
-    mark_page_used(7);
-    mark_page_used(8);
-
-    if is_page_used(6) {
-        writeln!(uart, "FAIL: page 6 incorrectly marked used").unwrap();
-        bitmap_passed = false;
-    }
-
-    if !is_page_used(7) {
-        writeln!(uart, "FAIL: page 7 was not marked used").unwrap();
-        bitmap_passed = false;
-    }
-
-    if !is_page_used(8) {
-        writeln!(uart, "FAIL: page 8 was not marked used").unwrap();
-        bitmap_passed = false;
-    }
-
-    if is_page_used(9) {
-        writeln!(uart, "FAIL: page 9 incorrectly marked used").unwrap();
-        bitmap_passed = false;
-    }
-
-    // Clean up.
-    mark_page_free(7);
-    mark_page_free(8);
-
-    if bitmap_passed {
-        writeln!(uart, "PASS: page bitmap").unwrap();
-    } else {
-        writeln!(uart, "FAIL: page bitmap").unwrap();
-    }
-
-    // ========================================================
-    // Single page allocation
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing single page allocation...").unwrap();
-
-    let first_page = alloc_page();
-
-    match first_page {
-        Some(addr) => {
-            writeln!(uart, "Allocated page: {:#x}", addr).unwrap();
-
-            let expected = FIRST_FREE_PAGE;
-
-            if addr == expected {
-                writeln!(uart, "PASS: first page address").unwrap();
-            } else {
-                writeln!(
-                    uart,
-                    "FAIL: expected {:#x}, got {:#x}",
-                    expected,
-                    addr
-                )
-                .unwrap();
-            }
-
-            let page = (addr - FIRST_FREE_PAGE) / PAGE_SIZE;
-
-            if is_page_used(page) {
-                writeln!(uart, "PASS: allocated page marked used").unwrap();
-            } else {
-                writeln!(uart, "FAIL: allocated page still free").unwrap();
-            }
-
-            free_page(addr);
-
-            if !is_page_used(page) {
-                writeln!(uart, "PASS: freed page marked free").unwrap();
-            } else {
-                writeln!(uart, "FAIL: freed page still used").unwrap();
-            }
-        }
-
-        None => {
-            writeln!(uart, "FAIL: could not allocate page").unwrap();
+        b = b.wrapping_add(1);
+        writeln!(uart, "B value = {:#x}", b).ok();
+        if b == 2000 {
+            task_exit();
         }
     }
-
-    // ========================================================
-    // Multiple page allocation
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing multiple page allocation...").unwrap();
-
-    let a = alloc_page();
-    let b = alloc_page();
-    let c = alloc_page();
-
-    match (a, b, c) {
-        (Some(a), Some(b), Some(c)) => {
-            writeln!(uart, "Page A: {:#x}", a).unwrap();
-            writeln!(uart, "Page B: {:#x}", b).unwrap();
-            writeln!(uart, "Page C: {:#x}", c).unwrap();
-
-            let mut passed = true;
-
-            if a == b {
-                writeln!(uart, "FAIL: A == B").unwrap();
-                passed = false;
-            }
-
-            if a == c {
-                writeln!(uart, "FAIL: A == C").unwrap();
-                passed = false;
-            }
-
-            if b == c {
-                writeln!(uart, "FAIL: B == C").unwrap();
-                passed = false;
-            }
-
-            if passed {
-                writeln!(uart, "PASS: allocations are unique").unwrap();
-            }
-
-            free_page(a);
-            free_page(b);
-            free_page(c);
-
-            writeln!(uart, "Freed A, B, C").unwrap();
+}
+fn task_c() {
+    unsafe {
+        let mut uart = Uart::new(0x0900_0000);
+        writeln!(uart, "================================").unwrap();
+        writeln!(uart, "        RAM / PAGE TEST         ").unwrap();
+        writeln!(uart, "================================").unwrap();
+        let ram_end = core::ptr::addr_of!(RAM_END).read();
+        let kernel_end = core::ptr::addr_of!(KERNEL_END).read();
+        let first_free_page = core::ptr::addr_of!(FIRST_FREE_PAGE).read();
+        let page_count = core::ptr::addr_of!(PAGE_COUNT).read();
+        let bitmap_size = core::ptr::addr_of!(BITMAP_SIZE).read();
+        writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap();
+        writeln!(uart, "RAM_START: {:#x}", RAM_START).unwrap();
+        writeln!(uart, "RAM_END: {:#x}", ram_end).unwrap();
+        writeln!(uart, "KERNEL_END: {:#x}", kernel_end).unwrap();
+        writeln!(uart, "FIRST_FREE_PAGE: {:#x}", first_free_page).unwrap();
+        writeln!(uart, "PAGE_COUNT: {}", page_count).unwrap();
+        writeln!(uart, "BITMAP_SIZE: {}", bitmap_size).unwrap();
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing page bitmap...").unwrap();
+        let mut bitmap_passed = true;
+        if is_page_used(0) {
+            writeln!(uart, "FAIL: page 0 starts used").unwrap();
+            bitmap_passed = false;
         }
-
-        _ => {
-            writeln!(uart, "FAIL: could not allocate three pages").unwrap();
-
-            if let Some(addr) = a {
+        mark_page_used(0);
+        if !is_page_used(0) {
+            writeln!(uart, "FAIL: page 0 was not marked used").unwrap();
+            bitmap_passed = false;
+        }
+        mark_page_free(0);
+        if is_page_used(0) {
+            writeln!(uart, "FAIL: page 0 was not marked free").unwrap();
+            bitmap_passed = false;
+        }
+        mark_page_used(7);
+        mark_page_used(8);
+        if is_page_used(6) {
+            writeln!(uart, "FAIL: page 6 incorrectly marked used").unwrap();
+            bitmap_passed = false;
+        }
+        if !is_page_used(7) {
+            writeln!(uart, "FAIL: page 7 was not marked used").unwrap();
+            bitmap_passed = false;
+        }
+        if !is_page_used(8) {
+            writeln!(uart, "FAIL: page 8 was not marked used").unwrap();
+            bitmap_passed = false;
+        }
+        if is_page_used(9) {
+            writeln!(uart, "FAIL: page 9 incorrectly marked used").unwrap();
+            bitmap_passed = false;
+        }
+        mark_page_free(7);
+        mark_page_free(8);
+        if bitmap_passed {
+            writeln!(uart, "PASS: page bitmap").unwrap();
+        } else {
+            writeln!(uart, "FAIL: page bitmap").unwrap();
+        }
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing single page allocation...").unwrap();
+        let first_page = alloc_page();
+        match first_page {
+            Some(addr) => {
+                writeln!(uart, "Allocated page: {:#x}", addr).unwrap();
+                let expected = FIRST_FREE_PAGE;
+                if addr == expected {
+                    writeln!(uart, "PASS: first page address").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: expected {:#x}, got {:#x}", expected, addr).unwrap();
+                }
+                let page = (addr - FIRST_FREE_PAGE) / PAGE_SIZE;
+                if is_page_used(page) {
+                    writeln!(uart, "PASS: allocated page marked used").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: allocated page still free").unwrap();
+                }
                 free_page(addr);
+                if !is_page_used(page) {
+                    writeln!(uart, "PASS: freed page marked free").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: freed page still used").unwrap();
+                }
             }
-
-            if let Some(addr) = b {
-                free_page(addr);
-            }
-
-            if let Some(addr) = c {
-                free_page(addr);
+            None => {
+                writeln!(uart, "FAIL: could not allocate page").unwrap();
             }
         }
-    }
-
-    // ========================================================
-    // Reuse freed page
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing page reuse...").unwrap();
-
-    let a = alloc_page();
-
-    match a {
-        Some(a) => {
-            writeln!(uart, "First allocation: {:#x}", a).unwrap();
-
-            free_page(a);
-
-            writeln!(uart, "Freed page").unwrap();
-
-            let b = alloc_page();
-
-            match b {
-                Some(b) => {
-                    writeln!(uart, "Second allocation: {:#x}", b).unwrap();
-
-                    if a == b {
-                        writeln!(uart, "PASS: freed page was reused").unwrap();
-                    } else {
-                        writeln!(
-                            uart,
-                            "FAIL: expected {:#x}, got {:#x}",
-                            a,
-                            b
-                        )
-                        .unwrap();
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing multiple page allocation...").unwrap();
+        let a = alloc_page();
+        let b = alloc_page();
+        let c = alloc_page();
+        match (a, b, c) {
+            (Some(a), Some(b), Some(c)) => {
+                writeln!(uart, "Page A: {:#x}", a).unwrap();
+                writeln!(uart, "Page B: {:#x}", b).unwrap();
+                writeln!(uart, "Page C: {:#x}", c).unwrap();
+                let mut passed = true;
+                if a == b {
+                    writeln!(uart, "FAIL: A == B").unwrap();
+                    passed = false;
+                }
+                if a == c {
+                    writeln!(uart, "FAIL: A == C").unwrap();
+                    passed = false;
+                }
+                if b == c {
+                    writeln!(uart, "FAIL: B == C").unwrap();
+                    passed = false;
+                }
+                if passed {
+                    writeln!(uart, "PASS: allocations are unique").unwrap();
+                }
+                free_page(a);
+                free_page(b);
+                free_page(c);
+                writeln!(uart, "Freed A, B, C").unwrap();
+            }
+            _ => {
+                writeln!(uart, "FAIL: could not allocate three pages").unwrap();
+                if let Some(addr) = a {
+                    free_page(addr);
+                }
+                if let Some(addr) = b {
+                    free_page(addr);
+                }
+                if let Some(addr) = c {
+                    free_page(addr);
+                }
+            }
+        }
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing page reuse...").unwrap();
+        let a = alloc_page();
+        match a {
+            Some(a) => {
+                writeln!(uart, "First allocation: {:#x}", a).unwrap();
+                free_page(a);
+                writeln!(uart, "Freed page").unwrap();
+                let b = alloc_page();
+                match b {
+                    Some(b) => {
+                        writeln!(uart, "Second allocation: {:#x}", b).unwrap();
+                        if a == b {
+                            writeln!(uart, "PASS: freed page was reused").unwrap();
+                        } else {
+                            writeln!(uart, "FAIL: expected {:#x}, got {:#x}", a, b).unwrap();
+                        }
+                        free_page(b);
                     }
-
-                    free_page(b);
-                }
-
-                None => {
-                    writeln!(uart, "FAIL: could not reallocate page").unwrap();
+                    None => {
+                        writeln!(uart, "FAIL: could not reallocate page").unwrap();
+                    }
                 }
             }
+            None => {
+                writeln!(uart, "FAIL: initial allocation failed").unwrap();
+            }
         }
-
-        None => {
-            writeln!(uart, "FAIL: initial allocation failed").unwrap();
-        }
-    }
-
-    // ========================================================
-    // Actual RAM access
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing actual RAM access...").unwrap();
-
-    let page = alloc_page();
-
-    match page {
-        Some(addr) => {
-            writeln!(uart, "Allocated test page: {:#x}", addr).unwrap();
-
-            let ptr = addr as *mut u8;
-
-            // Write a pattern across the entire page.
-            unsafe {
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing actual RAM access...").unwrap();
+        let page = alloc_page();
+        match page {
+            Some(addr) => {
+                writeln!(uart, "Allocated test page: {:#x}", addr).unwrap();
+                let ptr = addr as *mut u8;
                 for i in 0..PAGE_SIZE {
                     ptr.add(i).write_volatile(0xAA);
                 }
-            }
-
-            writeln!(uart, "Wrote 0xAA to entire page").unwrap();
-
-            let mut passed = true;
-
-            // Read the entire page back.
-            unsafe {
+                writeln!(uart, "Wrote 0xAA to entire page").unwrap();
+                let mut passed = true;
                 for i in 0..PAGE_SIZE {
                     let value = ptr.add(i).read_volatile();
-
                     if value != 0xAA {
-                        writeln!(
-                            uart,
-                            "FAIL: byte {} = {:#x}",
-                            i,
-                            value
-                        )
-                        .unwrap();
-
+                        writeln!(uart, "FAIL: byte {} = {:#x}", i, value).unwrap();
                         passed = false;
                         break;
                     }
                 }
-            }
-
-            if passed {
-                writeln!(uart, "PASS: entire page read back correctly").unwrap();
-            }
-
-            // Test a second pattern.
-            unsafe {
+                if passed {
+                    writeln!(uart, "PASS: entire page read back correctly").unwrap();
+                }
                 for i in 0..PAGE_SIZE {
                     ptr.add(i).write_volatile(0x55);
                 }
-            }
-
-            writeln!(uart, "Wrote 0x55 to entire page").unwrap();
-
-            let mut passed = true;
-
-            unsafe {
+                writeln!(uart, "Wrote 0x55 to entire page").unwrap();
+                let mut passed = true;
                 for i in 0..PAGE_SIZE {
                     let value = ptr.add(i).read_volatile();
-
                     if value != 0x55 {
-                        writeln!(
-                            uart,
-                            "FAIL: byte {} = {:#x}",
-                            i,
-                            value
-                        )
-                        .unwrap();
-
+                        writeln!(uart, "FAIL: byte {} = {:#x}", i, value).unwrap();
                         passed = false;
                         break;
                     }
                 }
+                if passed {
+                    writeln!(uart, "PASS: second RAM pattern").unwrap();
+                }
+                free_page(addr);
+                writeln!(uart, "Test page freed").unwrap();
             }
-
-            if passed {
-                writeln!(uart, "PASS: second RAM pattern").unwrap();
+            None => {
+                writeln!(uart, "FAIL: could not allocate RAM test page").unwrap();
             }
-
-            free_page(addr);
-
-            writeln!(uart, "Test page freed").unwrap();
         }
-
-        None => {
-            writeln!(uart, "FAIL: could not allocate RAM test page").unwrap();
+        writeln!(uart, "L0[0] = {:#018x}", PAGE_TABLE_L0.entries[0].0).unwrap();
+        writeln!(uart, "L1[0] = {:#018x}", PAGE_TABLE_L1_RAM.entries[0].0).unwrap();
+        writeln!(uart, "L2[0] = {:#018x}", PAGE_TABLE_L2_RAM.entries[0].0).unwrap();
+        writeln!(uart, "L2[1] = {:#018x}", PAGE_TABLE_L2_RAM.entries[1].0).unwrap();
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "================================").unwrap();
+        writeln!(uart, "          RAM TESTED            ").unwrap();
+        writeln!(uart, "================================").unwrap();
+        loop {
+            yield_now();
         }
-    }
-    writeln!(
-        uart,
-        "L0[0] = {:#018x}",
-        unsafe { PAGE_TABLE_L1.entries[1].0 }
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "L1[0] = {:#018x}",
-        unsafe { PAGE_TABLE_L1.entries[0].0 }
-    ).unwrap();
-    writeln!(
-        uart,
-        "L2[0] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_RAM.entries[0].0 }
-    ).unwrap();
-    writeln!(
-        uart,
-        "L2[1] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_RAM.entries[1].0 }
-    ).unwrap();
-    // ========================================================
-    // Final state
-    // ========================================================
-
-    writeln!(uart, "").unwrap();
-    writeln!(uart, "================================").unwrap();
-    writeln!(uart, "          RAM TESTED            ").unwrap();
-    writeln!(uart, "================================").unwrap();
-
-    loop {
-        yield_now();
-    }
     }
 }
 // ============================================================
@@ -632,16 +448,12 @@ impl Scheduler {
         if self.tasks.count <= 1 {
             return None;
         }
-
         let start = self.current;
-
         for offset in 1..self.tasks.count {
             let id = (start + offset) % self.tasks.count;
-
             if id == 0 {
                 continue;
             }
-
             match &self.tasks.tasks[id] {
                 Some(task) if task.state == TaskState::Ready => {
                     return Some(id);
@@ -649,9 +461,8 @@ impl Scheduler {
                 _ => {}
             }
         }
-
         None
-}
+    }
     fn start(&mut self, frame: &mut ExceptionFrame) {
         if self.started {
             return;
@@ -839,155 +650,107 @@ impl Timer {
         }
     }
 }
-
 // ============================================================
 // RAM / Physical Page Allocator
 // ============================================================
-
 const PAGE_SIZE: usize = 4096;
 const RAM_START: usize = 0x4000_0000;
-// Maximum RAM the allocator can manage.
-// 512 MiB.
 const MAX_RAM_END: usize = 0x6000_0000;
-const MAX_PAGE_COUNT: usize =
-    (MAX_RAM_END - RAM_START) / PAGE_SIZE;
-const MAX_BITMAP_SIZE: usize =
-    (MAX_PAGE_COUNT + 7) / 8;
-// One bit per physical page.
+const MAX_PAGE_COUNT: usize = (MAX_RAM_END - RAM_START) / PAGE_SIZE;
+const MAX_BITMAP_SIZE: usize = (MAX_PAGE_COUNT + 7) / 8;
 #[unsafe(link_section = ".page_bitmap")]
-static mut PAGE_BITMAP: [u8; MAX_BITMAP_SIZE] =
-    [0; MAX_BITMAP_SIZE];
+static mut PAGE_BITMAP: [u8; MAX_BITMAP_SIZE] = [0; MAX_BITMAP_SIZE];
 static mut RAM_END: usize = MAX_RAM_END;
 static mut KERNEL_END: usize = 0;
 static mut FIRST_FREE_PAGE: usize = 0;
 static mut PAGE_COUNT: usize = 0;
 static mut BITMAP_SIZE: usize = 0;
-
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
 }
-
 // ------------------------------------------------------------
 // Initialisation
 // ------------------------------------------------------------
-
 fn init_memory() {
     unsafe {
         KERNEL_END = &_kernel_end as *const u8 as usize;
-
-        FIRST_FREE_PAGE =
-            (KERNEL_END + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        PAGE_COUNT =
-            (RAM_END - FIRST_FREE_PAGE) / PAGE_SIZE;
-
-        BITMAP_SIZE =
-            (PAGE_COUNT + 7) / 8;
-
-        // Start with every page free.
+        FIRST_FREE_PAGE = (KERNEL_END + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        PAGE_COUNT = (RAM_END - FIRST_FREE_PAGE) / PAGE_SIZE;
+        BITMAP_SIZE = (PAGE_COUNT + 7) / 8;
         let bitmap_ptr = core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
-
         for i in 0..BITMAP_SIZE {
             bitmap_ptr.add(i).write(0);
         }
     }
 }
-
 // ------------------------------------------------------------
 // Bitmap operations
 // ------------------------------------------------------------
-
 fn is_page_used(page: usize) -> bool {
     unsafe {
         assert!(page < PAGE_COUNT);
-
         let byte = page / 8;
         let bit = page % 8;
         let mask = 1u8 << bit;
-
-        let bitmap_ptr =
-            core::ptr::addr_of!(PAGE_BITMAP) as *const u8;
-
+        let bitmap_ptr = core::ptr::addr_of!(PAGE_BITMAP) as *const u8;
         (bitmap_ptr.add(byte).read() & mask) != 0
     }
 }
-
 fn mark_page_used(page: usize) {
     unsafe {
         assert!(page < PAGE_COUNT);
-
         let byte = page / 8;
         let bit = page % 8;
         let mask = 1u8 << bit;
-
-        let bitmap_ptr =
-            core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
-
+        let bitmap_ptr = core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
         let ptr = bitmap_ptr.add(byte);
-
         *ptr |= mask;
     }
 }
-
 fn mark_page_free(page: usize) {
     unsafe {
         assert!(page < PAGE_COUNT);
-
         let byte = page / 8;
         let bit = page % 8;
         let mask = 1u8 << bit;
-
-        let bitmap_ptr =
-            core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
-
+        let bitmap_ptr = core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
         let ptr = bitmap_ptr.add(byte);
-
         *ptr &= !mask;
     }
 }
-
 // ------------------------------------------------------------
 // Allocate one physical page
 // ------------------------------------------------------------
-
 fn alloc_page() -> Option<usize> {
     unsafe {
         for page in 0..PAGE_COUNT {
             if !is_page_used(page) {
                 mark_page_used(page);
-
-                let address =
-                    FIRST_FREE_PAGE + page * PAGE_SIZE;
-
+                let address = FIRST_FREE_PAGE + page * PAGE_SIZE;
                 return Some(address);
             }
         }
     }
-
     None
 }
-
 // ------------------------------------------------------------
 // Free one physical page
 // ------------------------------------------------------------
-
 fn free_page(address: usize) {
     unsafe {
         assert!(address >= FIRST_FREE_PAGE);
         assert!(address < RAM_END);
         assert!(address % PAGE_SIZE == 0);
-
-        let page =
-            (address - FIRST_FREE_PAGE) / PAGE_SIZE;
-
+        let page = (address - FIRST_FREE_PAGE) / PAGE_SIZE;
         assert!(page < PAGE_COUNT);
         assert!(is_page_used(page));
-
         mark_page_free(page);
     }
 }
-
+// ============================================================
+// Page tables
+// ============================================================
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct PageTableEntry(u64);
@@ -995,53 +758,70 @@ impl PageTableEntry {
     const fn invalid() -> Self {
         Self(0)
     }
-
     const fn new(value: u64) -> Self {
         Self(value)
     }
-
     fn is_valid(&self) -> bool {
         self.0 & 1 != 0
     }
-
     fn new_table(table: *const PageTable) -> Self {
-        let address = table as *const PageTable as u64;
+        let address = table as u64;
         Self(address | 0b11)
     }
+    const fn new_block(
+        address: usize,
+        attr_index: u64,
+        ap: u64,
+        sh: u64,
+        xn: bool,
+    ) -> Self {
+        let mut value =
+            ((address as u64) & 0x0000_0000_FFE0_0000)
+            | 0b01                         // block
+            | (attr_index << 2)            // AttrIndx
+            | (ap << 6)                    // AP
+            | (sh << 8)                    // SH
+            | (1 << 10);                   // AF
 
-    fn new_block(address: usize, attr_index: u64) -> Self {
-        Self(
-            (address as u64 & 0x0000_FFFF_FFE0_0000)
-                | 0b01                 // block descriptor
-                | (1 << 10)             // AF
-                | (attr_index << 2)     // AttrIndx
-        )
+        if xn {
+            value |= 1 << 54;              // UXN
+            value |= 1 << 53;              // PXN
+        }
+
+        Self(value)
     }
 }
 #[repr(C, align(4096))]
 struct PageTable {
-    entries: [PageTableEntry; 512]
+    entries: [PageTableEntry; 512],
 }
 impl PageTable {
-    const fn new() -> Self{
-        Self{entries : [PageTableEntry::invalid(); 512],}
+    const fn new() -> Self {
+        Self {
+            entries: [PageTableEntry::invalid(); 512],
+        }
     }
 }
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l0")]
 static mut PAGE_TABLE_L0: PageTable = PageTable::new();
-static mut PAGE_TABLE_L1: PageTable = PageTable::new();
-static mut PAGE_TABLE_L2_RAM: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l1_low")]
+static mut PAGE_TABLE_L1_LOW: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l1_ram")]
+static mut PAGE_TABLE_L1_RAM: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l2_device")]
 static mut PAGE_TABLE_L2_DEVICE: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l2_ram")]
+static mut PAGE_TABLE_L2_RAM: PageTable = PageTable::new();
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
 fn init_mair() {
     unsafe {
-        // Attr0 = Normal memory, Inner/Outer Write-Back,
-        // Read/Write Allocate
-        //
-        // Attr1 = Device-nGnRE
-        let mair: u64 =
-            0x04FF;
-
+        let mair: u64 = 0x04FF;
         core::arch::asm!(
             "msr mair_el1, {0}",
             "isb",
@@ -1051,17 +831,43 @@ fn init_mair() {
 }
 fn init_tcr() {
     unsafe {
-        // T0SZ = 25 -> 39-bit VA space
-        // TG0  = 00 -> 4 KiB granules
-        // SH0  = 11 -> Inner Shareable
-        // IRGN0/ORGN0 = 01 -> Write-back, Read/Write allocate
-        // IPS = 010 -> 40-bit physical address space
         let tcr: u64 =
-            (25 << 0)  |   // T0SZ
-            (0b01 << 8) |   // IRGN0
-            (0b01 << 10) |  // ORGN0
-            (0b11 << 12) |  // SH0
-            (0b010 << 32);  // IPS = 40-bit
+            // TTBR0: 48-bit VA space
+            (16 << 0)
+
+            // Inner cacheability: Write-Back
+            | (0b01 << 8)
+
+            // Outer cacheability: Write-Back
+            | (0b01 << 10)
+
+            // Inner Shareable
+            | (0b11 << 12)
+
+            // TG0 = 4 KiB
+            | (0b00 << 14)
+
+            // TTBR1: unused, but valid
+            // 48-bit VA space
+            | (16 << 16)
+
+            // Inner cacheability
+            | (0b01 << 24)
+
+            // Outer cacheability
+            | (0b01 << 26)
+
+            // Inner Shareable
+            | (0b11 << 28)
+
+            // TG1 = 4 KiB
+            | (0b10 << 30)
+
+            // EPD1: disable TTBR1 walks
+            | (1 << 23)
+
+            // IPS = 40-bit physical addresses
+            | (0b010 << 32);
 
         core::arch::asm!(
             "msr tcr_el1, {0}",
@@ -1072,9 +878,7 @@ fn init_tcr() {
 }
 fn init_ttbr0() {
     unsafe {
-        let l0 =
-            &raw const PAGE_TABLE_L0 as *const _ as u64;
-
+        let l0 = &raw const PAGE_TABLE_L0 as *const _ as u64;
         core::arch::asm!(
             "msr ttbr0_el1, {0}",
             "dsb sy",
@@ -1083,6 +887,66 @@ fn init_ttbr0() {
         );
     }
 }
+unsafe fn test_page_table() {
+    // ========================================================
+    // L0
+    // ========================================================
+
+    // All addresses we currently use are in the lower
+    // 512 GiB, so they all use L0[0].
+    PAGE_TABLE_L0.entries[0] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L1_LOW);
+
+    // ========================================================
+    // L1
+    // ========================================================
+
+    // 0x00000000..0x3FFFFFFF
+    // Contains our device mappings at 0x08000000 and 0x09000000.
+    PAGE_TABLE_L1_LOW.entries[0] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_DEVICE);
+
+    // 0x40000000..0x7FFFFFFF
+    // Contains our kernel RAM.
+    PAGE_TABLE_L1_LOW.entries[1] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_RAM);
+
+    // ========================================================
+    // L2: devices
+    // ========================================================
+
+    // 0x08000000
+    PAGE_TABLE_L2_DEVICE.entries[64] =
+        PageTableEntry::new_block(0x08000000, ATTR_DEVICE, 0b00, 0b10, true);
+
+    // 0x09000000
+    PAGE_TABLE_L2_DEVICE.entries[72] =
+        PageTableEntry::new_block(0x09000000, ATTR_DEVICE, 0b00, 0b10, true,);
+
+    // ========================================================
+    // L2: RAM
+    // ========================================================
+
+    // 0x40000000..0x401FFFFF
+    // AP = 0b11 (EL1 read-only), not writable; keeps it executable.
+    map_ram();
+
+}
+unsafe fn map_ram() {
+    for i in 0..256 {
+        PAGE_TABLE_L2_RAM.entries[i] =
+            PageTableEntry::new_block(
+                0x4000_0000 + i * 0x20_0000,
+                ATTR_NORMAL,
+                0b00,
+                0b11,
+                false,
+            );
+    }
+}
+// ============================================================
+// MMU / stack transition
+// ============================================================
 fn enable_mmu() {
     unsafe {
         let mut sctlr: u64;
@@ -1092,100 +956,19 @@ fn enable_mmu() {
             out(reg) sctlr,
         );
 
-        sctlr |= 1 << 0;      // M = 1
-        sctlr &= !(1 << 2);   // C = 0
-        sctlr &= !(1 << 12);  // I = 0
+        // Enable MMU
+        sctlr |= 1 << 0;
 
-        // Don't do anything fancy yet.
+        // Disable WXN so writable kernel RAM can also be executable.
+        sctlr &= !(1 << 19);
+
         core::arch::asm!(
+            "dsb sy",
             "msr sctlr_el1, {0}",
+            "isb",
             in(reg) sctlr,
         );
-
-        // This executes only if the MSR returned.
-        core::arch::asm!("nop");
-
-        // Synchronise execution after changing SCTLR.
-        core::arch::asm!("isb");
     }
-}
-unsafe fn test_page_table() {
-    // --------------------------------------------------------
-    // L0
-    // --------------------------------------------------------
-
-    PAGE_TABLE_L0.entries[0] =
-        PageTableEntry::new_table(&raw const PAGE_TABLE_L1);
-
-    // --------------------------------------------------------
-    // L1
-    //
-    // 0x0000_0000 - 0x3FFF_FFFF
-    //  -> L2 RAM
-    //
-    // 0x4000_0000 - 0x7FFF_FFFF
-    //  -> L2 RAM
-    //
-    // 0x0800_0000 is actually inside the first L1 region,
-    // so give it its own L2 table if we want precise mapping.
-    // --------------------------------------------------------
-
-    PAGE_TABLE_L1.entries[0] =
-        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_DEVICE);
-
-    PAGE_TABLE_L1.entries[1] =
-        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_RAM);
-
-    // --------------------------------------------------------
-    // UART / device mappings
-    //
-    // L1[0] covers 0x0000_0000 - 0x3FFF_FFFF.
-    //
-    // L2 index:
-    //
-    // 0x0900_0000 / 0x20_0000 = 72
-    // --------------------------------------------------------
-
-    PAGE_TABLE_L2_DEVICE.entries[72] =
-        PageTableEntry::new_block(
-            0x0900_0000,
-            1,
-        );
-
-    // GIC distributor: 0x0800_0000
-    PAGE_TABLE_L2_DEVICE.entries[64] =
-        PageTableEntry::new_block(
-            0x0800_0000,
-            1,
-        );
-
-    // GIC CPU interface: 0x0801_0000
-    //
-    // It lies in the same 2 MiB block as 0x0800_0000,
-    // so the block beginning at 0x0800_0000 covers both.
-    
-    // --------------------------------------------------------
-    // RAM mappings
-    //
-    // L1[1] covers:
-    //
-    // 0x4000_0000 - 0x7FFF_FFFF
-    //
-    // L2[0] = 0x4000_0000
-    // L2[1] = 0x4020_0000
-    // --------------------------------------------------------
-
-    PAGE_TABLE_L2_RAM.entries[0] =
-        PageTableEntry::new_block(
-            0x4000_0000,
-            0,
-        );
-
-    PAGE_TABLE_L2_RAM.entries[1] =
-        PageTableEntry::new_block(
-            0x4020_0000,
-            0,
-        );
 }
 // ============================================================
 // Exception decoding
@@ -1333,28 +1116,12 @@ extern "C" fn exception_irq_rust(frame: &mut ExceptionFrame, interrupt_id: u32) 
     if interrupt_id != 30 {
         return;
     }
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let _tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     Timer::set_timeout(Timer::frequency() / 10);
     unsafe {
         let scheduler_ptr = &raw mut SCHEDULER;
         if let Some(scheduler) = (*scheduler_ptr).as_mut() {
             scheduler.tick(frame);
-            let mut uart = Uart::new(0x0900_0000);
-            if scheduler.current != 0 {
-            //writeln!(
-            //    uart,
-            //    "TICK {} -> TASK {} frame_pc={:#018x} saved_pc={:#018x} SP={:#018x}",
-            //   tick,
-            //   scheduler.current,
-            //    frame.elr,
-            //    scheduler.tasks.tasks[scheduler.current]
-            //        .as_ref()
-            //         .map(|t| t.context.pc)
-            //        .unwrap_or(0),
-            //     frame.sp,
-            //  )
-            // .ok();
-        }
         }
     }
 }
@@ -1412,30 +1179,28 @@ pub extern "C" fn rust_start() -> ! {
     init_memory();
     writeln!(uart, "Memory allocator initialised!").unwrap();
     writeln!(uart, "Initialising MMU...").unwrap();
-    unsafe{test_page_table();}
-    writeln!(
-        uart,
-        "L2 RAM[0] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_RAM.entries[0].0 }
-    ).unwrap();
+    unsafe {
+        test_page_table();
+        writeln!(uart, "L0[0] = {:#018x}", PAGE_TABLE_L0.entries[0].0).unwrap();
+        writeln!(uart, "L0[1] = {:#018x}", PAGE_TABLE_L0.entries[1].0).unwrap();
+        writeln!(uart, "L1_LOW[0] = {:#018x}", PAGE_TABLE_L1_LOW.entries[0].0).unwrap();
+        writeln!(uart, "L1_RAM[0] = {:#018x}", PAGE_TABLE_L1_RAM.entries[0].0).unwrap();
+        writeln!(uart, "L2_DEVICE[64] = {:#018x}", PAGE_TABLE_L2_DEVICE.entries[64].0).unwrap();
+        writeln!(uart, "L2_DEVICE[72] = {:#018x}", PAGE_TABLE_L2_DEVICE.entries[72].0).unwrap();
+        writeln!(uart, "L2_RAM[0] = {:#018x}", PAGE_TABLE_L2_RAM.entries[0].0).unwrap();
+        writeln!(uart, "L2_RAM[1] = {:#018x}", PAGE_TABLE_L2_RAM.entries[1].0).unwrap();
+    }
+    unsafe {
+    let entry = PAGE_TABLE_L2_RAM.entries[0].0;
 
-    writeln!(
-        uart,
-        "L2 RAM[1] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_RAM.entries[1].0 }
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "L2 DEVICE[64] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_DEVICE.entries[64].0 }
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "L2 DEVICE[72] = {:#018x}",
-        unsafe { PAGE_TABLE_L2_DEVICE.entries[72].0 }
-    ).unwrap();
+    writeln!(uart, "RAM descriptor = {:#018x}", entry).unwrap();
+    writeln!(uart, "  valid = {}", entry & 1 != 0).unwrap();
+    writeln!(uart, "  type  = {:#x}", entry & 0b11).unwrap();
+    writeln!(uart, "  AP    = {:#x}", (entry >> 6) & 0b11).unwrap();
+    writeln!(uart, "  SH    = {:#x}", (entry >> 8) & 0b11).unwrap();
+    writeln!(uart, "  AF    = {}", (entry >> 10) & 1).unwrap();
+    writeln!(uart, "  Attr  = {:#x}", (entry >> 2) & 0b111).unwrap();
+}
     writeln!(uart, "Page tables configured!").unwrap();
     init_mair();
     writeln!(uart, "MAIR configured!").unwrap();
@@ -1448,7 +1213,6 @@ pub extern "C" fn rust_start() -> ! {
         let ttbr0: u64;
         let mair: u64;
         let sctlr: u64;
-
         core::arch::asm!(
             "mrs {0}, tcr_el1",
             "mrs {1}, ttbr0_el1",
@@ -1459,55 +1223,59 @@ pub extern "C" fn rust_start() -> ! {
             out(reg) mair,
             out(reg) sctlr,
         );
-
         writeln!(uart, "TCR  = {:#018x}", tcr).unwrap();
         writeln!(uart, "TTBR0 = {:#018x}", ttbr0).unwrap();
         writeln!(uart, "MAIR = {:#018x}", mair).unwrap();
         writeln!(uart, "SCTLR = {:#018x}", sctlr).unwrap();
     }
-    writeln!(
-        uart,
-        "rust_start = {:#018x}",
-        rust_start as usize
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "exception_vector = {:#018x}",
-        exception_vector as usize
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "_kernel_start = {:#018x}",
-        unsafe { &_kernel_start as *const u8 as usize }
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "_kernel_end = {:#018x}",
-        unsafe { &_kernel_end as *const u8 as usize }
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "STACK = {:#018x}",
-        &raw const STACK as *const _ as usize
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "PAGE_TABLE_L0 = {:#018x}",
-        &raw const PAGE_TABLE_L0 as *const _ as usize
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "SCHEDULER = {:#018x}",
-        &raw const SCHEDULER as *const _ as usize
-    ).unwrap();
+    writeln!(uart, "rust_start = {:#018x}", rust_start as usize).unwrap();
+    writeln!(uart, "exception_vector = {:#018x}", exception_vector as usize).unwrap();
+    writeln!(uart, "_kernel_start = {:#018x}", unsafe {
+        &_kernel_start as *const u8 as usize
+    }).unwrap();
+    writeln!(uart, "_kernel_end = {:#018x}", unsafe {
+        &_kernel_end as *const u8 as usize
+    }).unwrap();
+    writeln!(uart, "STACK = {:#018x}", &raw const STACK as *const _ as usize).unwrap();
+    writeln!(uart, "PAGE_TABLE_L0 = {:#018x}", &raw const PAGE_TABLE_L0 as *const _ as usize).unwrap();
+    writeln!(uart, "SCHEDULER = {:#018x}", &raw const SCHEDULER as *const _ as usize).unwrap();
     writeln!(uart, "Enabling MMU...").unwrap();
+    let sp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, sp",
+            out(reg) sp,
+        );
+    }
+    writeln!(uart, "SP before MMU = {:#018x}", sp).unwrap();
+    unsafe {
+    writeln!(
+        uart,
+        "L2_RAM[0] address = {:#018x}",
+        &raw const PAGE_TABLE_L2_RAM.entries[0] as *const _ as usize
+    ).unwrap();
+
+    writeln!(
+        uart,
+        "L2_RAM[0] value   = {:#018x}",
+        PAGE_TABLE_L2_RAM.entries[0].0
+    ).unwrap();
+}
+    unsafe {
+    writeln!(
+        uart,
+        "L1_LOW[1] = {:#018x}",
+        PAGE_TABLE_L1_LOW.entries[1].0
+    ).unwrap();
+}
+    unsafe {
+    let entry = PAGE_TABLE_L2_RAM.entries[0].0;
+
+    writeln!(uart, "RAM PXN = {}", (entry >> 53) & 1).unwrap();
+    writeln!(uart, "RAM UXN = {}", (entry >> 54) & 1).unwrap();
+}
     enable_mmu();
+
     writeln!(uart, "MMU enabled!").unwrap();
     writeln!(uart, "Initialising scheduler...").unwrap();
     unsafe {
