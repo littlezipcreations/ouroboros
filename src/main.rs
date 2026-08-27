@@ -21,7 +21,12 @@ impl Uart {
     }
     fn put_byte(&self, byte: u8) {
         unsafe {
-            (self.base as *mut u8).write_volatile(byte);
+            let base = self.base as *mut u32;
+
+            // Wait while the transmit FIFO is full.
+            while base.add(0x18 / 4).read_volatile() & (1 << 5) != 0 {}
+
+            base.write_volatile(byte as u32);
         }
     }
     fn write_bytes(&self, s: &str) {
@@ -195,17 +200,20 @@ fn task_b() { //RR test 2
         }
     }
 }
-fn task_c() { //RAM test
+fn task_c() { // RAM test
     unsafe {
         let mut uart = Uart::new(0x0900_0000);
+
         writeln!(uart, "================================").unwrap();
         writeln!(uart, "        RAM / PAGE TEST         ").unwrap();
         writeln!(uart, "================================").unwrap();
+
         let ram_end = core::ptr::addr_of!(RAM_END).read();
         let kernel_end = core::ptr::addr_of!(KERNEL_END).read();
         let first_free_page = core::ptr::addr_of!(FIRST_FREE_PAGE).read();
         let page_count = core::ptr::addr_of!(PAGE_COUNT).read();
         let bitmap_size = core::ptr::addr_of!(BITMAP_SIZE).read();
+
         writeln!(uart, "PAGE_SIZE: {}", PAGE_SIZE).unwrap();
         writeln!(uart, "RAM_START: {:#x}", RAM_START).unwrap();
         writeln!(uart, "RAM_END: {:#x}", ram_end).unwrap();
@@ -213,338 +221,616 @@ fn task_c() { //RAM test
         writeln!(uart, "FIRST_FREE_PAGE: {:#x}", first_free_page).unwrap();
         writeln!(uart, "PAGE_COUNT: {}", page_count).unwrap();
         writeln!(uart, "BITMAP_SIZE: {}", bitmap_size).unwrap();
+
+        // ========================================================
+        // Page bitmap
+        // ========================================================
+
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing page bitmap...").unwrap();
+
         let mut bitmap_passed = true;
+
         if is_page_used(0) {
             writeln!(uart, "FAIL: page 0 starts used").unwrap();
             bitmap_passed = false;
         }
+
         mark_page_used(0);
+
         if !is_page_used(0) {
             writeln!(uart, "FAIL: page 0 was not marked used").unwrap();
             bitmap_passed = false;
         }
+
         mark_page_free(0);
+
         if is_page_used(0) {
             writeln!(uart, "FAIL: page 0 was not marked free").unwrap();
             bitmap_passed = false;
         }
+
         mark_page_used(7);
         mark_page_used(8);
+
         if is_page_used(6) {
             writeln!(uart, "FAIL: page 6 incorrectly marked used").unwrap();
             bitmap_passed = false;
         }
+
         if !is_page_used(7) {
             writeln!(uart, "FAIL: page 7 was not marked used").unwrap();
             bitmap_passed = false;
         }
+
         if !is_page_used(8) {
             writeln!(uart, "FAIL: page 8 was not marked used").unwrap();
             bitmap_passed = false;
         }
+
         if is_page_used(9) {
             writeln!(uart, "FAIL: page 9 incorrectly marked used").unwrap();
             bitmap_passed = false;
         }
+
         mark_page_free(7);
         mark_page_free(8);
+
         if bitmap_passed {
             writeln!(uart, "PASS: page bitmap").unwrap();
         } else {
             writeln!(uart, "FAIL: page bitmap").unwrap();
         }
+
+        // ========================================================
+        // Single page allocation
+        // ========================================================
+
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing single page allocation...").unwrap();
+
         let first_page = alloc_page();
+
         match first_page {
             Some(addr) => {
                 writeln!(uart, "Allocated page: {:#x}", addr).unwrap();
+
                 let expected = FIRST_FREE_PAGE;
+
                 if addr == expected {
                     writeln!(uart, "PASS: first page address").unwrap();
                 } else {
-                    writeln!(uart, "FAIL: expected {:#x}, got {:#x}", expected, addr).unwrap();
+                    writeln!(
+                        uart,
+                        "FAIL: expected {:#x}, got {:#x}",
+                        expected,
+                        addr
+                    ).unwrap();
                 }
+
                 let page = (addr - FIRST_FREE_PAGE) / PAGE_SIZE;
+
                 if is_page_used(page) {
                     writeln!(uart, "PASS: allocated page marked used").unwrap();
                 } else {
                     writeln!(uart, "FAIL: allocated page still free").unwrap();
                 }
+
                 free_page(addr);
+
                 if !is_page_used(page) {
                     writeln!(uart, "PASS: freed page marked free").unwrap();
                 } else {
                     writeln!(uart, "FAIL: freed page still used").unwrap();
                 }
             }
+
             None => {
                 writeln!(uart, "FAIL: could not allocate page").unwrap();
             }
         }
+
+        // ========================================================
+        // Multiple page allocation
+        // ========================================================
+
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing multiple page allocation...").unwrap();
+
         let a = alloc_page();
         let b = alloc_page();
         let c = alloc_page();
+
         match (a, b, c) {
             (Some(a), Some(b), Some(c)) => {
                 writeln!(uart, "Page A: {:#x}", a).unwrap();
                 writeln!(uart, "Page B: {:#x}", b).unwrap();
                 writeln!(uart, "Page C: {:#x}", c).unwrap();
+
                 let mut passed = true;
+
                 if a == b {
                     writeln!(uart, "FAIL: A == B").unwrap();
                     passed = false;
                 }
+
                 if a == c {
                     writeln!(uart, "FAIL: A == C").unwrap();
                     passed = false;
                 }
+
                 if b == c {
                     writeln!(uart, "FAIL: B == C").unwrap();
                     passed = false;
                 }
+
                 if passed {
                     writeln!(uart, "PASS: allocations are unique").unwrap();
                 }
+
                 free_page(a);
                 free_page(b);
                 free_page(c);
+
                 writeln!(uart, "Freed A, B, C").unwrap();
             }
+
             _ => {
                 writeln!(uart, "FAIL: could not allocate three pages").unwrap();
+
                 if let Some(addr) = a {
                     free_page(addr);
                 }
+
                 if let Some(addr) = b {
                     free_page(addr);
                 }
+
                 if let Some(addr) = c {
                     free_page(addr);
                 }
             }
         }
+
+        // ========================================================
+        // Page reuse
+        // ========================================================
+
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing page reuse...").unwrap();
+
         let a = alloc_page();
+
         match a {
             Some(a) => {
                 writeln!(uart, "First allocation: {:#x}", a).unwrap();
+
                 free_page(a);
+
                 writeln!(uart, "Freed page").unwrap();
+
                 let b = alloc_page();
+
                 match b {
                     Some(b) => {
                         writeln!(uart, "Second allocation: {:#x}", b).unwrap();
+
                         if a == b {
                             writeln!(uart, "PASS: freed page was reused").unwrap();
                         } else {
-                            writeln!(uart, "FAIL: expected {:#x}, got {:#x}", a, b).unwrap();
+                            writeln!(
+                                uart,
+                                "FAIL: expected {:#x}, got {:#x}",
+                                a,
+                                b
+                            ).unwrap();
                         }
+
                         free_page(b);
                     }
+
                     None => {
                         writeln!(uart, "FAIL: could not reallocate page").unwrap();
                     }
                 }
             }
+
             None => {
                 writeln!(uart, "FAIL: initial allocation failed").unwrap();
             }
         }
+
+        // ========================================================
+        // Physical RAM access
+        // ========================================================
+
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing actual RAM access...").unwrap();
+
         let page = alloc_page();
+
         match page {
             Some(addr) => {
                 writeln!(uart, "Allocated test page: {:#x}", addr).unwrap();
+
                 let ptr = addr as *mut u8;
+
                 for i in 0..PAGE_SIZE {
                     ptr.add(i).write_volatile(0xAA);
                 }
+
                 writeln!(uart, "Wrote 0xAA to entire page").unwrap();
+
                 let mut passed = true;
+
                 for i in 0..PAGE_SIZE {
                     let value = ptr.add(i).read_volatile();
+
                     if value != 0xAA {
-                        writeln!(uart, "FAIL: byte {} = {:#x}", i, value).unwrap();
+                        writeln!(
+                            uart,
+                            "FAIL: byte {} = {:#x}",
+                            i,
+                            value
+                        ).unwrap();
+
                         passed = false;
                         break;
                     }
                 }
+
                 if passed {
-                    writeln!(uart, "PASS: entire page read back correctly").unwrap();
+                    writeln!(
+                        uart,
+                        "PASS: entire page read back correctly"
+                    ).unwrap();
                 }
+
                 for i in 0..PAGE_SIZE {
                     ptr.add(i).write_volatile(0x55);
                 }
+
                 writeln!(uart, "Wrote 0x55 to entire page").unwrap();
+
                 let mut passed = true;
+
                 for i in 0..PAGE_SIZE {
                     let value = ptr.add(i).read_volatile();
+
                     if value != 0x55 {
-                        writeln!(uart, "FAIL: byte {} = {:#x}", i, value).unwrap();
+                        writeln!(
+                            uart,
+                            "FAIL: byte {} = {:#x}",
+                            i,
+                            value
+                        ).unwrap();
+
                         passed = false;
                         break;
                     }
                 }
+
                 if passed {
                     writeln!(uart, "PASS: second RAM pattern").unwrap();
                 }
+
                 free_page(addr);
+
                 writeln!(uart, "Test page freed").unwrap();
             }
+
             None => {
                 writeln!(uart, "FAIL: could not allocate RAM test page").unwrap();
             }
         }
-        writeln!(uart, "L0[0] = {:#018x}", PAGE_TABLE_L0.entries[0].0).unwrap();
-        writeln!(uart, "L1[0] = {:#018x}", PAGE_TABLE_L1_RAM.entries[0].0).unwrap();
-        writeln!(uart, "L2[0] = {:#018x}", PAGE_TABLE_L2_RAM.entries[0].0).unwrap();
-        writeln!(uart, "L2[1] = {:#018x}", PAGE_TABLE_L2_RAM.entries[1].0).unwrap();
+
+        // ========================================================
+        // Page table debug
+        // ========================================================
+
+        writeln!(
+            uart,
+            "L0[0] = {:#018x}",
+            PAGE_TABLE_L0.entries[0].0
+        ).unwrap();
+
+        writeln!(
+            uart,
+            "L1[0] = {:#018x}",
+            PAGE_TABLE_L1_RAM.entries[0].0
+        ).unwrap();
+
+        writeln!(
+            uart,
+            "L2[0] = {:#018x}",
+            PAGE_TABLE_L2_RAM.entries[0].0
+        ).unwrap();
+
+        writeln!(
+            uart,
+            "L2[1] = {:#018x}",
+            PAGE_TABLE_L2_RAM.entries[1].0
+        ).unwrap();
+
+        // ========================================================
+        // Single virtual page mapping
+        // ========================================================
+
         writeln!(uart, "").unwrap();
-        unsafe {
-            let physical = alloc_page();
+        writeln!(uart, "Testing single virtual page mapping...").unwrap();
 
-            match physical {
-                Some(physical) => {
-                    writeln!(
-                        uart,
-                        "Allocated physical page: {:#x}",
-                        physical
-                    ).unwrap();
+        let physical = alloc_page();
 
-                    map_page(VMAP_START, physical);
+        match physical {
+            Some(physical) => {
+                writeln!(
+                    uart,
+                    "Allocated physical page: {:#x}",
+                    physical
+                ).unwrap();
 
-                    writeln!(
-                        uart,
-                        "Mapped {:#x} -> {:#x}",
-                        VMAP_START,
-                        physical
-                    ).unwrap();
+                map_page(VMAP_START, physical);
 
-                    let ptr = VMAP_START as *mut u64;
+                writeln!(
+                    uart,
+                    "Mapped {:#x} -> {:#x}",
+                    VMAP_START,
+                    physical
+                ).unwrap();
 
-                    ptr.write_volatile(0x1234_5678_9ABC_DEF0);
+                let ptr = VMAP_START as *mut u64;
 
-                    let value = ptr.read_volatile();
+                ptr.write_volatile(0x1234_5678_9ABC_DEF0);
 
-                    writeln!(
-                        uart,
-                        "Read through VA: {:#x}",
-                        value
-                    ).unwrap();
+                let value = ptr.read_volatile();
 
-                    free_page(physical);
+                writeln!(
+                    uart,
+                    "Read through VA: {:#018x}",
+                    value
+                ).unwrap();
+
+                if value == 0x1234_5678_9ABC_DEF0 {
+                    writeln!(uart, "PASS: single virtual mapping").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: single virtual mapping").unwrap();
                 }
 
-                None => {
-                    writeln!(uart, "Failed to allocate test page").unwrap();
-                }
+                unmap_page(VMAP_START);
+
+                writeln!(uart, "Unmapped single virtual page").unwrap();
+
+                free_page(physical);
+
+                writeln!(uart, "Physical page freed").unwrap();
+            }
+
+            None => {
+                writeln!(
+                    uart,
+                    "FAIL: could not allocate virtual mapping test page"
+                ).unwrap();
             }
         }
+
+        // ========================================================
+        // Multiple virtual page mappings
+        // ========================================================
+
         writeln!(uart, "").unwrap();
-    writeln!(uart, "Testing multiple virtual page mappings...").unwrap();
+        writeln!(
+            uart,
+            "Testing multiple virtual page mappings..."
+        ).unwrap();
 
-    let physical_a = alloc_page();
-    let physical_b = alloc_page();
-    let physical_c = alloc_page();
+        let physical_a = alloc_page();
+        let physical_b = alloc_page();
+        let physical_c = alloc_page();
 
-    match (physical_a, physical_b, physical_c) {
-        (Some(a), Some(b), Some(c)) => {
-            let virtual_a = 0x8000_3000usize;
-            let virtual_b = 0x8000_4000usize;
-            let virtual_c = 0x8000_5000usize;
+        match (physical_a, physical_b, physical_c) {
+            (Some(a), Some(b), Some(c)) => {
+                let virtual_a = VMAP_START + 0x3000;
+                let virtual_b = VMAP_START + 0x4000;
+                let virtual_c = VMAP_START + 0x5000;
 
-            writeln!(uart, "Physical A: {:#x}", a).unwrap();
-            writeln!(uart, "Physical B: {:#x}", b).unwrap();
-            writeln!(uart, "Physical C: {:#x}", c).unwrap();
+                writeln!(uart, "Physical A: {:#x}", a).unwrap();
+                writeln!(uart, "Physical B: {:#x}", b).unwrap();
+                writeln!(uart, "Physical C: {:#x}", c).unwrap();
 
-            unsafe {
                 map_page(virtual_a, a);
                 map_page(virtual_b, b);
                 map_page(virtual_c, c);
-            }
 
-            writeln!(
-                uart,
-                "Mapped {:#x} -> {:#x}",
-                virtual_a,
-                a
-            ).unwrap();
+                writeln!(
+                    uart,
+                    "Mapped {:#x} -> {:#x}",
+                    virtual_a,
+                    a
+                ).unwrap();
 
-            writeln!(
-                uart,
-                "Mapped {:#x} -> {:#x}",
-                virtual_b,
-                b
-            ).unwrap();
+                writeln!(
+                    uart,
+                    "Mapped {:#x} -> {:#x}",
+                    virtual_b,
+                    b
+                ).unwrap();
 
-            writeln!(
-                uart,
-                "Mapped {:#x} -> {:#x}",
-                virtual_c,
-                c
-            ).unwrap();
+                writeln!(
+                    uart,
+                    "Mapped {:#x} -> {:#x}",
+                    virtual_c,
+                    c
+                ).unwrap();
 
-            unsafe {
-                (virtual_a as *mut u64).write_volatile(0x1111_1111_1111_1111);
-                (virtual_b as *mut u64).write_volatile(0x2222_2222_2222_2222);
-                (virtual_c as *mut u64).write_volatile(0x3333_3333_3333_3333);
+                let ptr_a = virtual_a as *mut u64;
+                let ptr_b = virtual_b as *mut u64;
+                let ptr_c = virtual_c as *mut u64;
 
-                let value_a = (virtual_a as *const u64).read_volatile();
-                let value_b = (virtual_b as *const u64).read_volatile();
-                let value_c = (virtual_c as *const u64).read_volatile();
+                ptr_a.write_volatile(0x1111_1111_1111_1111);
+                ptr_b.write_volatile(0x2222_2222_2222_2222);
+                ptr_c.write_volatile(0x3333_3333_3333_3333);
 
-                writeln!(uart, "VA A read: {:#018x}", value_a).unwrap();
-                writeln!(uart, "VA B read: {:#018x}", value_b).unwrap();
-                writeln!(uart, "VA C read: {:#018x}", value_c).unwrap();
+                let value_a = ptr_a.read_volatile();
+                let value_b = ptr_b.read_volatile();
+                let value_c = ptr_c.read_volatile();
+
+                writeln!(
+                    uart,
+                    "VA A read: {:#018x}",
+                    value_a
+                ).unwrap();
+
+                writeln!(
+                    uart,
+                    "VA B read: {:#018x}",
+                    value_b
+                ).unwrap();
+
+                writeln!(
+                    uart,
+                    "VA C read: {:#018x}",
+                    value_c
+                ).unwrap();
 
                 if value_a == 0x1111_1111_1111_1111
                     && value_b == 0x2222_2222_2222_2222
                     && value_c == 0x3333_3333_3333_3333
                 {
-                    writeln!(uart, "PASS: multiple virtual mappings").unwrap();
+                    writeln!(
+                        uart,
+                        "PASS: multiple virtual mappings"
+                    ).unwrap();
                 } else {
-                    writeln!(uart, "FAIL: multiple virtual mappings").unwrap();
+                    writeln!(
+                        uart,
+                        "FAIL: multiple virtual mappings"
+                    ).unwrap();
+                }
+
+                // Unmap before freeing the physical pages.
+                unmap_page(virtual_a);
+                unmap_page(virtual_b);
+                unmap_page(virtual_c);
+
+                writeln!(
+                    uart,
+                    "Unmapped A, B, C"
+                ).unwrap();
+
+                free_page(a);
+                free_page(b);
+                free_page(c);
+
+                writeln!(
+                    uart,
+                    "Physical pages freed"
+                ).unwrap();
+            }
+
+            _ => {
+                writeln!(
+                    uart,
+                    "FAIL: could not allocate three pages"
+                ).unwrap();
+
+                if let Some(addr) = physical_a {
+                    free_page(addr);
+                }
+
+                if let Some(addr) = physical_b {
+                    free_page(addr);
+                }
+
+                if let Some(addr) = physical_c {
+                    free_page(addr);
+                }
+            }
+        }
+        writeln!(uart, "").unwrap();
+        writeln!(uart, "Testing virtual page allocator...").unwrap();
+
+        let va_a = alloc_virtual_page();
+        let va_b = alloc_virtual_page();
+        let va_c = alloc_virtual_page();
+
+        match (va_a, va_b, va_c) {
+            (Some(a), Some(b), Some(c)) => {
+                writeln!(uart, "Virtual A: {:#x}", a).unwrap();
+                writeln!(uart, "Virtual B: {:#x}", b).unwrap();
+                writeln!(uart, "Virtual C: {:#x}", c).unwrap();
+
+                if a != b && a != c && b != c {
+                    writeln!(uart, "PASS: virtual pages are unique").unwrap();
+                } else {
+                    writeln!(uart, "FAIL: virtual pages overlap").unwrap();
+                }
+
+                free_virtual_page(a);
+                free_virtual_page(b);
+                free_virtual_page(c);
+
+                writeln!(uart, "Freed virtual pages").unwrap();
+
+                let reused = alloc_virtual_page();
+
+                match reused {
+                    Some(address) => {
+                        if address == a {
+                            writeln!(
+                                uart,
+                                "PASS: virtual page was reused"
+                            ).unwrap();
+                        } else {
+                            writeln!(
+                                uart,
+                                "FAIL: expected {:#x}, got {:#x}",
+                                a,
+                                address
+                            ).unwrap();
+                        }
+
+                        free_virtual_page(address);
+                    }
+
+                    None => {
+                        writeln!(
+                            uart,
+                            "FAIL: could not reuse virtual page"
+                        ).unwrap();
+                    }
                 }
             }
 
-            free_page(a);
-            free_page(b);
-            free_page(c);
+            _ => {
+                writeln!(
+                    uart,
+                    "FAIL: could not allocate three virtual pages"
+                ).unwrap();
 
-            writeln!(uart, "Physical pages freed").unwrap();
-        }
+                if let Some(a) = va_a {
+                    free_virtual_page(a);
+                }
 
-        _ => {
-            writeln!(uart, "FAIL: could not allocate three pages").unwrap();
+                if let Some(b) = va_b {
+                    free_virtual_page(b);
+                }
 
-            if let Some(a) = physical_a {
-                free_page(a);
-            }
-
-            if let Some(b) = physical_b {
-                free_page(b);
-            }
-
-            if let Some(c) = physical_c {
-                free_page(c);
+                if let Some(c) = va_c {
+                    free_virtual_page(c);
+                }
             }
         }
-}
+
         writeln!(uart, "================================").unwrap();
         writeln!(uart, "          RAM TESTED            ").unwrap();
         writeln!(uart, "================================").unwrap();
+
         loop {
             yield_now();
         }
     }
 }
+
 // ============================================================
 // Idle
 // ============================================================
@@ -798,6 +1084,9 @@ static mut BITMAP_SIZE: usize = 0;
 const VMAP_START: usize = 0x8000_0000;
 const VMAP_SIZE: usize = 0x20_0000;
 const VMAP_END: usize = VMAP_START + VMAP_SIZE;
+const VMAP_PAGE_COUNT: usize = VMAP_SIZE / PAGE_SIZE;
+const VMAP_BITMAP_SIZE: usize = (VMAP_PAGE_COUNT + 7) /8;
+static mut VMAP_BITMAP: [u8; VMAP_BITMAP_SIZE] = [0; VMAP_BITMAP_SIZE];
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
@@ -830,6 +1119,15 @@ fn is_page_used(page: usize) -> bool {
         (bitmap_ptr.add(byte).read() & mask) != 0
     }
 }
+fn is_virtual_page_used(page: usize) -> bool{
+    unsafe{
+        assert!(page < VMAP_PAGE_COUNT);
+        let byte = page / 8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+        (VMAP_BITMAP[byte] & mask) != 0
+    }
+}
 fn mark_page_used(page: usize) {
     unsafe {
         assert!(page < PAGE_COUNT);
@@ -841,6 +1139,15 @@ fn mark_page_used(page: usize) {
         *ptr |= mask;
     }
 }
+fn mark_virtual_page_used(page: usize){
+    unsafe{
+        assert!(page < VMAP_PAGE_COUNT);
+        let byte = page /8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+        VMAP_BITMAP[byte] |= mask;
+    }
+}
 fn mark_page_free(page: usize) {
     unsafe {
         assert!(page < PAGE_COUNT);
@@ -850,6 +1157,15 @@ fn mark_page_free(page: usize) {
         let bitmap_ptr = core::ptr::addr_of_mut!(PAGE_BITMAP) as *mut u8;
         let ptr = bitmap_ptr.add(byte);
         *ptr &= !mask;
+    }
+}
+fn mark_virtual_page_free(page: usize){
+    unsafe{
+        assert!(page < VMAP_PAGE_COUNT);
+        let byte = page /8;
+        let bit = page % 8;
+        let mask = 1u8 << bit;
+        VMAP_BITMAP[byte] &= !mask;
     }
 }
 fn alloc_page() -> Option<usize> {
@@ -864,6 +1180,16 @@ fn alloc_page() -> Option<usize> {
     }
     None
 }
+fn alloc_virtual_page() -> Option<usize> {
+    for page in 0..VMAP_PAGE_COUNT{
+        if !is_virtual_page_used(page){
+            mark_virtual_page_used(page);
+            let address = VMAP_START + page * PAGE_SIZE;
+            return Some(address);
+        }
+    }
+    None
+}
 fn free_page(address: usize) {
     unsafe {
         assert!(address >= FIRST_FREE_PAGE);
@@ -874,6 +1200,15 @@ fn free_page(address: usize) {
         assert!(is_page_used(page));
         mark_page_free(page);
     }
+}
+fn free_virtual_page(address: usize){
+    assert!(address >= VMAP_START);
+    assert!(address < VMAP_END);
+    assert!(address % PAGE_SIZE == 0);
+    let page = (address - VMAP_START) / PAGE_SIZE;
+    assert!(page < VMAP_PAGE_COUNT);
+    assert!(is_virtual_page_used(page));
+    mark_virtual_page_free(page);
 }
 unsafe fn map_page(virt_addr: usize, phys_addr: usize){
     assert!(virt_addr % PAGE_SIZE == 0);
@@ -891,6 +1226,14 @@ unsafe fn map_page(virt_addr: usize, phys_addr: usize){
             0b11,
             false
         )
+}
+unsafe fn unmap_page(virt_addr: usize) {
+    assert!(virt_addr % PAGE_SIZE == 0);
+    assert!(virt_addr >= VMAP_START);
+    assert!(virt_addr < VMAP_END);
+    let index = (virt_addr >> 12) & 0x1FF;
+    assert!(PAGE_TABLE_L3_VMAP.entries[index].is_valid());
+    PAGE_TABLE_L3_VMAP.entries[index] = PageTableEntry::invalid();
 }
 // ============================================================
 // Page tables
