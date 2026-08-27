@@ -719,9 +719,6 @@ fn mark_page_free(page: usize) {
         *ptr &= !mask;
     }
 }
-// ------------------------------------------------------------
-// Allocate one physical page
-// ------------------------------------------------------------
 fn alloc_page() -> Option<usize> {
     unsafe {
         for page in 0..PAGE_COUNT {
@@ -734,9 +731,6 @@ fn alloc_page() -> Option<usize> {
     }
     None
 }
-// ------------------------------------------------------------
-// Free one physical page
-// ------------------------------------------------------------
 fn free_page(address: usize) {
     unsafe {
         assert!(address >= FIRST_FREE_PAGE);
@@ -747,6 +741,13 @@ fn free_page(address: usize) {
         assert!(is_page_used(page));
         mark_page_free(page);
     }
+}
+unsafe fn map_page(l3: &mut PageTable, index: usize, physical: usize){
+    assert!(physical % PAGE_SIZE == 0);
+    assert!(index < 512);
+
+    l3.entries[index] = PageTableEntry::new_page(physical, ATTR_NORMAL, 0b00, 0b11, false,);
+    
 }
 // ============================================================
 // Page tables
@@ -790,6 +791,14 @@ impl PageTableEntry {
 
         Self(value)
     }
+    const fn new_page(address: usize, attr_index: u64, ap: u64, sh: u64, xn: bool) -> Self{
+        let mut value = ((address as u64) & 0x0000_FFFF_FFFF_F000) | 0b11 | (attr_index << 2) | (ap << 6) | (sh << 8) | (1 << 10);
+        if xn {
+            value |= 1 << 54;
+            value |= 1 << 53;
+        }
+        Self(value)
+    }
 }
 #[repr(C, align(4096))]
 struct PageTable {
@@ -817,6 +826,9 @@ static mut PAGE_TABLE_L2_DEVICE: PageTable = PageTable::new();
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_table_l2_ram")]
 static mut PAGE_TABLE_L2_RAM: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l3")]
+static mut PAGE_TABLE_L3: PageTable = PageTable::new();
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
 fn init_mair() {
@@ -887,7 +899,7 @@ fn init_ttbr0() {
         );
     }
 }
-unsafe fn test_page_table() {
+unsafe fn set_page_table() {
     // ========================================================
     // L0
     // ========================================================
@@ -1180,27 +1192,8 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Memory allocator initialised!").unwrap();
     writeln!(uart, "Initialising MMU...").unwrap();
     unsafe {
-        test_page_table();
-        writeln!(uart, "L0[0] = {:#018x}", PAGE_TABLE_L0.entries[0].0).unwrap();
-        writeln!(uart, "L0[1] = {:#018x}", PAGE_TABLE_L0.entries[1].0).unwrap();
-        writeln!(uart, "L1_LOW[0] = {:#018x}", PAGE_TABLE_L1_LOW.entries[0].0).unwrap();
-        writeln!(uart, "L1_RAM[0] = {:#018x}", PAGE_TABLE_L1_RAM.entries[0].0).unwrap();
-        writeln!(uart, "L2_DEVICE[64] = {:#018x}", PAGE_TABLE_L2_DEVICE.entries[64].0).unwrap();
-        writeln!(uart, "L2_DEVICE[72] = {:#018x}", PAGE_TABLE_L2_DEVICE.entries[72].0).unwrap();
-        writeln!(uart, "L2_RAM[0] = {:#018x}", PAGE_TABLE_L2_RAM.entries[0].0).unwrap();
-        writeln!(uart, "L2_RAM[1] = {:#018x}", PAGE_TABLE_L2_RAM.entries[1].0).unwrap();
+        set_page_table();
     }
-    unsafe {
-    let entry = PAGE_TABLE_L2_RAM.entries[0].0;
-
-    writeln!(uart, "RAM descriptor = {:#018x}", entry).unwrap();
-    writeln!(uart, "  valid = {}", entry & 1 != 0).unwrap();
-    writeln!(uart, "  type  = {:#x}", entry & 0b11).unwrap();
-    writeln!(uart, "  AP    = {:#x}", (entry >> 6) & 0b11).unwrap();
-    writeln!(uart, "  SH    = {:#x}", (entry >> 8) & 0b11).unwrap();
-    writeln!(uart, "  AF    = {}", (entry >> 10) & 1).unwrap();
-    writeln!(uart, "  Attr  = {:#x}", (entry >> 2) & 0b111).unwrap();
-}
     writeln!(uart, "Page tables configured!").unwrap();
     init_mair();
     writeln!(uart, "MAIR configured!").unwrap();
@@ -1223,22 +1216,7 @@ pub extern "C" fn rust_start() -> ! {
             out(reg) mair,
             out(reg) sctlr,
         );
-        writeln!(uart, "TCR  = {:#018x}", tcr).unwrap();
-        writeln!(uart, "TTBR0 = {:#018x}", ttbr0).unwrap();
-        writeln!(uart, "MAIR = {:#018x}", mair).unwrap();
-        writeln!(uart, "SCTLR = {:#018x}", sctlr).unwrap();
     }
-    writeln!(uart, "rust_start = {:#018x}", rust_start as usize).unwrap();
-    writeln!(uart, "exception_vector = {:#018x}", exception_vector as usize).unwrap();
-    writeln!(uart, "_kernel_start = {:#018x}", unsafe {
-        &_kernel_start as *const u8 as usize
-    }).unwrap();
-    writeln!(uart, "_kernel_end = {:#018x}", unsafe {
-        &_kernel_end as *const u8 as usize
-    }).unwrap();
-    writeln!(uart, "STACK = {:#018x}", &raw const STACK as *const _ as usize).unwrap();
-    writeln!(uart, "PAGE_TABLE_L0 = {:#018x}", &raw const PAGE_TABLE_L0 as *const _ as usize).unwrap();
-    writeln!(uart, "SCHEDULER = {:#018x}", &raw const SCHEDULER as *const _ as usize).unwrap();
     writeln!(uart, "Enabling MMU...").unwrap();
     let sp: u64;
     unsafe {
@@ -1247,33 +1225,6 @@ pub extern "C" fn rust_start() -> ! {
             out(reg) sp,
         );
     }
-    writeln!(uart, "SP before MMU = {:#018x}", sp).unwrap();
-    unsafe {
-    writeln!(
-        uart,
-        "L2_RAM[0] address = {:#018x}",
-        &raw const PAGE_TABLE_L2_RAM.entries[0] as *const _ as usize
-    ).unwrap();
-
-    writeln!(
-        uart,
-        "L2_RAM[0] value   = {:#018x}",
-        PAGE_TABLE_L2_RAM.entries[0].0
-    ).unwrap();
-}
-    unsafe {
-    writeln!(
-        uart,
-        "L1_LOW[1] = {:#018x}",
-        PAGE_TABLE_L1_LOW.entries[1].0
-    ).unwrap();
-}
-    unsafe {
-    let entry = PAGE_TABLE_L2_RAM.entries[0].0;
-
-    writeln!(uart, "RAM PXN = {}", (entry >> 53) & 1).unwrap();
-    writeln!(uart, "RAM UXN = {}", (entry >> 54) & 1).unwrap();
-}
     enable_mmu();
 
     writeln!(uart, "MMU enabled!").unwrap();
