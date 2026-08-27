@@ -552,271 +552,60 @@ fn task_c() { // RAM test
             PAGE_TABLE_L2_RAM.entries[1].0
         ).unwrap();
 
-        // ========================================================
-        // Single virtual page mapping
-        // ========================================================
-
         writeln!(uart, "").unwrap();
-        writeln!(uart, "Testing single virtual page mapping...").unwrap();
+        writeln!(uart, "Testing VM allocator...").unwrap();
 
-        let physical = alloc_page();
+        let a = vm_alloc_page();
+        let b = vm_alloc_page();
+        let c = vm_alloc_page();
 
-        match physical {
-            Some(physical) => {
-                writeln!(
-                    uart,
-                    "Allocated physical page: {:#x}",
-                    physical
-                ).unwrap();
-
-                map_page(VMAP_START, physical);
-
-                writeln!(
-                    uart,
-                    "Mapped {:#x} -> {:#x}",
-                    VMAP_START,
-                    physical
-                ).unwrap();
-
-                let ptr = VMAP_START as *mut u64;
-
-                ptr.write_volatile(0x1234_5678_9ABC_DEF0);
-
-                let value = ptr.read_volatile();
-
-                writeln!(
-                    uart,
-                    "Read through VA: {:#018x}",
-                    value
-                ).unwrap();
-
-                if value == 0x1234_5678_9ABC_DEF0 {
-                    writeln!(uart, "PASS: single virtual mapping").unwrap();
-                } else {
-                    writeln!(uart, "FAIL: single virtual mapping").unwrap();
-                }
-
-                unmap_page(VMAP_START);
-
-                writeln!(uart, "Unmapped single virtual page").unwrap();
-
-                free_page(physical);
-
-                writeln!(uart, "Physical page freed").unwrap();
-            }
-
-            None => {
-                writeln!(
-                    uart,
-                    "FAIL: could not allocate virtual mapping test page"
-                ).unwrap();
-            }
-        }
-
-        // ========================================================
-        // Multiple virtual page mappings
-        // ========================================================
-
-        writeln!(uart, "").unwrap();
-        writeln!(
-            uart,
-            "Testing multiple virtual page mappings..."
-        ).unwrap();
-
-        let physical_a = alloc_page();
-        let physical_b = alloc_page();
-        let physical_c = alloc_page();
-
-        match (physical_a, physical_b, physical_c) {
+        match (a, b, c) {
             (Some(a), Some(b), Some(c)) => {
-                let virtual_a = VMAP_START + 0x3000;
-                let virtual_b = VMAP_START + 0x4000;
-                let virtual_c = VMAP_START + 0x5000;
+                writeln!(uart, "VA A: {:#x}", a).unwrap();
+                writeln!(uart, "VA B: {:#x}", b).unwrap();
+                writeln!(uart, "VA C: {:#x}", c).unwrap();
 
-                writeln!(uart, "Physical A: {:#x}", a).unwrap();
-                writeln!(uart, "Physical B: {:#x}", b).unwrap();
-                writeln!(uart, "Physical C: {:#x}", c).unwrap();
+                unsafe {
+                    (a as *mut u64).write_volatile(0xAAAAAAAAAAAAAAAA);
+                    (b as *mut u64).write_volatile(0xBBBBBBBBBBBBBBBB);
+                    (c as *mut u64).write_volatile(0xCCCCCCCCCCCCCCCC);
 
-                map_page(virtual_a, a);
-                map_page(virtual_b, b);
-                map_page(virtual_c, c);
+                    assert_eq!(
+                        (a as *const u64).read_volatile(),
+                        0xAAAAAAAAAAAAAAAA
+                    );
 
-                writeln!(
-                    uart,
-                    "Mapped {:#x} -> {:#x}",
-                    virtual_a,
-                    a
-                ).unwrap();
+                    assert_eq!(
+                        (b as *const u64).read_volatile(),
+                        0xBBBBBBBBBBBBBBBB
+                    );
 
-                writeln!(
-                    uart,
-                    "Mapped {:#x} -> {:#x}",
-                    virtual_b,
-                    b
-                ).unwrap();
-
-                writeln!(
-                    uart,
-                    "Mapped {:#x} -> {:#x}",
-                    virtual_c,
-                    c
-                ).unwrap();
-
-                let ptr_a = virtual_a as *mut u64;
-                let ptr_b = virtual_b as *mut u64;
-                let ptr_c = virtual_c as *mut u64;
-
-                ptr_a.write_volatile(0x1111_1111_1111_1111);
-                ptr_b.write_volatile(0x2222_2222_2222_2222);
-                ptr_c.write_volatile(0x3333_3333_3333_3333);
-
-                let value_a = ptr_a.read_volatile();
-                let value_b = ptr_b.read_volatile();
-                let value_c = ptr_c.read_volatile();
-
-                writeln!(
-                    uart,
-                    "VA A read: {:#018x}",
-                    value_a
-                ).unwrap();
-
-                writeln!(
-                    uart,
-                    "VA B read: {:#018x}",
-                    value_b
-                ).unwrap();
-
-                writeln!(
-                    uart,
-                    "VA C read: {:#018x}",
-                    value_c
-                ).unwrap();
-
-                if value_a == 0x1111_1111_1111_1111
-                    && value_b == 0x2222_2222_2222_2222
-                    && value_c == 0x3333_3333_3333_3333
-                {
-                    writeln!(
-                        uart,
-                        "PASS: multiple virtual mappings"
-                    ).unwrap();
-                } else {
-                    writeln!(
-                        uart,
-                        "FAIL: multiple virtual mappings"
-                    ).unwrap();
+                    assert_eq!(
+                        (c as *const u64).read_volatile(),
+                        0xCCCCCCCCCCCCCCCC
+                    );
                 }
 
-                // Unmap before freeing the physical pages.
-                unmap_page(virtual_a);
-                unmap_page(virtual_b);
-                unmap_page(virtual_c);
+                writeln!(uart, "PASS: mapped pages usable").unwrap();
 
-                writeln!(
-                    uart,
-                    "Unmapped A, B, C"
-                ).unwrap();
+                vm_free_page(a);
+                vm_free_page(b);
+                vm_free_page(c);
 
-                free_page(a);
-                free_page(b);
-                free_page(c);
-
-                writeln!(
-                    uart,
-                    "Physical pages freed"
-                ).unwrap();
+                writeln!(uart, "PASS: pages freed").unwrap();
             }
 
             _ => {
-                writeln!(
-                    uart,
-                    "FAIL: could not allocate three pages"
-                ).unwrap();
+                writeln!(uart, "FAIL: vm_alloc_page failed").unwrap();
 
-                if let Some(addr) = physical_a {
-                    free_page(addr);
+                if let Some(a) = a {
+                    vm_free_page(a);
                 }
-
-                if let Some(addr) = physical_b {
-                    free_page(addr);
+                if let Some(b) = b {
+                    vm_free_page(b);
                 }
-
-                if let Some(addr) = physical_c {
-                    free_page(addr);
-                }
-            }
-        }
-        writeln!(uart, "").unwrap();
-        writeln!(uart, "Testing virtual page allocator...").unwrap();
-
-        let va_a = alloc_virtual_page();
-        let va_b = alloc_virtual_page();
-        let va_c = alloc_virtual_page();
-
-        match (va_a, va_b, va_c) {
-            (Some(a), Some(b), Some(c)) => {
-                writeln!(uart, "Virtual A: {:#x}", a).unwrap();
-                writeln!(uart, "Virtual B: {:#x}", b).unwrap();
-                writeln!(uart, "Virtual C: {:#x}", c).unwrap();
-
-                if a != b && a != c && b != c {
-                    writeln!(uart, "PASS: virtual pages are unique").unwrap();
-                } else {
-                    writeln!(uart, "FAIL: virtual pages overlap").unwrap();
-                }
-
-                free_virtual_page(a);
-                free_virtual_page(b);
-                free_virtual_page(c);
-
-                writeln!(uart, "Freed virtual pages").unwrap();
-
-                let reused = alloc_virtual_page();
-
-                match reused {
-                    Some(address) => {
-                        if address == a {
-                            writeln!(
-                                uart,
-                                "PASS: virtual page was reused"
-                            ).unwrap();
-                        } else {
-                            writeln!(
-                                uart,
-                                "FAIL: expected {:#x}, got {:#x}",
-                                a,
-                                address
-                            ).unwrap();
-                        }
-
-                        free_virtual_page(address);
-                    }
-
-                    None => {
-                        writeln!(
-                            uart,
-                            "FAIL: could not reuse virtual page"
-                        ).unwrap();
-                    }
-                }
-            }
-
-            _ => {
-                writeln!(
-                    uart,
-                    "FAIL: could not allocate three virtual pages"
-                ).unwrap();
-
-                if let Some(a) = va_a {
-                    free_virtual_page(a);
-                }
-
-                if let Some(b) = va_b {
-                    free_virtual_page(b);
-                }
-
-                if let Some(c) = va_c {
-                    free_virtual_page(c);
+                if let Some(c) = c {
+                    vm_free_page(c);
                 }
             }
         }
@@ -1483,6 +1272,37 @@ fn enable_mmu() {
         );
     }
 }
+// ============================================================
+// VM
+// ============================================================
+
+fn vm_alloc_page() -> Option<usize> {
+    let physical = alloc_page()?;
+    let virt_addr = match alloc_virtual_page(){
+        Some(addr) => addr,
+        None =>{
+            free_page(physical);
+            return None;
+        }
+    };
+    unsafe{
+        map_page(virt_addr, physical);
+    }
+    Some(virt_addr)
+
+}
+fn vm_free_page(virt_addr: usize){
+    unsafe {
+        let index = (virt_addr >> 12) & 0x1FF;
+        assert!(PAGE_TABLE_L3_VMAP.entries[index].is_valid());
+        let entry = PAGE_TABLE_L3_VMAP.entries[index].0;
+        let phys_addr = (entry >> 12) << 12;
+        unmap_page(virt_addr);
+        free_virtual_page(virt_addr);
+        free_page(phys_addr as usize);
+    }
+}
+
 // ============================================================
 // Exception decoding
 // ============================================================
