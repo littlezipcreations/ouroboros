@@ -53,9 +53,19 @@ SECTIONS
         KEEP(*(.page_table_l2_ram))
     }
     . = ALIGN(4096);
+    .page_table_l2_vmap : ALIGN(4096)
+    {
+        KEEP(*(.page_table_l2_vmap))
+    }
+    . = ALIGN(4096);
     .page_table_l3 : ALIGN(4096)
     {
         KEEP(*(.page_table_l3))
+    }
+    . = ALIGN(4096);
+    .page_table_l3_vmap : ALIGN(4096)
+    {
+        KEEP(*(.page_table_l3_vmap))
     }
 
     . = ALIGN(4096);

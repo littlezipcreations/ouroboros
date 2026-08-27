@@ -167,7 +167,7 @@ fn yield_now() {
 // ============================================================
 // Test tasks
 // ============================================================
-fn task_a() {
+fn task_a() { //RR test 1
     let mut uart = Uart::new(0x0900_0000);
     let mut a = 0u64;
     loop {
@@ -181,7 +181,7 @@ fn task_a() {
         }
     }
 }
-fn task_b() {
+fn task_b() { //RR test 2
     let mut uart = Uart::new(0x0900_0000);
     let mut b = 1000u64;
     loop {
@@ -195,7 +195,7 @@ fn task_b() {
         }
     }
 }
-fn task_c() {
+fn task_c() { //RAM test
     unsafe {
         let mut uart = Uart::new(0x0900_0000);
         writeln!(uart, "================================").unwrap();
@@ -407,6 +407,46 @@ fn task_c() {
         writeln!(uart, "L2[0] = {:#018x}", PAGE_TABLE_L2_RAM.entries[0].0).unwrap();
         writeln!(uart, "L2[1] = {:#018x}", PAGE_TABLE_L2_RAM.entries[1].0).unwrap();
         writeln!(uart, "").unwrap();
+        unsafe {
+            let physical = alloc_page();
+
+            match physical {
+                Some(physical) => {
+                    writeln!(
+                        uart,
+                        "Allocated physical page: {:#x}",
+                        physical
+                    ).unwrap();
+
+                    map_page(VMAP_START, physical);
+
+                    writeln!(
+                        uart,
+                        "Mapped {:#x} -> {:#x}",
+                        VMAP_START,
+                        physical
+                    ).unwrap();
+
+                    let ptr = VMAP_START as *mut u64;
+
+                    ptr.write_volatile(0x1234_5678_9ABC_DEF0);
+
+                    let value = ptr.read_volatile();
+
+                    writeln!(
+                        uart,
+                        "Read through VA: {:#x}",
+                        value
+                    ).unwrap();
+
+                    free_page(physical);
+                }
+
+                None => {
+                    writeln!(uart, "Failed to allocate test page").unwrap();
+                }
+            }
+        }
         writeln!(uart, "================================").unwrap();
         writeln!(uart, "          RAM TESTED            ").unwrap();
         writeln!(uart, "================================").unwrap();
@@ -665,6 +705,9 @@ static mut KERNEL_END: usize = 0;
 static mut FIRST_FREE_PAGE: usize = 0;
 static mut PAGE_COUNT: usize = 0;
 static mut BITMAP_SIZE: usize = 0;
+const VMAP_START: usize = 0x8000_0000;
+const VMAP_SIZE: usize = 0x20_0000;
+const VMAP_END: usize = VMAP_START + VMAP_SIZE;
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
@@ -742,12 +785,22 @@ fn free_page(address: usize) {
         mark_page_free(page);
     }
 }
-unsafe fn map_page(l3: &mut PageTable, index: usize, physical: usize){
-    assert!(physical % PAGE_SIZE == 0);
-    assert!(index < 512);
+unsafe fn map_page(virt_addr: usize, phys_addr: usize){
+    assert!(virt_addr % PAGE_SIZE == 0);
+    assert!(phys_addr % PAGE_SIZE == 0);
+    assert!(virt_addr >= VMAP_START);
+    assert!(virt_addr < VMAP_END);
 
-    l3.entries[index] = PageTableEntry::new_page(physical, ATTR_NORMAL, 0b00, 0b11, false,);
-    
+    let index = (virt_addr >> 12) & 0x1FF;
+    assert!(!PAGE_TABLE_L3_VMAP.entries[index].is_valid());
+    PAGE_TABLE_L3_VMAP.entries[index] = 
+        PageTableEntry::new_page(
+            phys_addr,
+            ATTR_NORMAL,
+            0b00,
+            0b11,
+            false
+        )
 }
 // ============================================================
 // Page tables
@@ -827,8 +880,14 @@ static mut PAGE_TABLE_L2_DEVICE: PageTable = PageTable::new();
 #[unsafe(link_section = ".page_table_l2_ram")]
 static mut PAGE_TABLE_L2_RAM: PageTable = PageTable::new();
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l2_vmap")]
+static mut PAGE_TABLE_L2_VMAP: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_table_l3")]
 static mut PAGE_TABLE_L3: PageTable = PageTable::new();
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".page_table_l3_vmap")]
+static mut PAGE_TABLE_L3_VMAP: PageTable = PageTable::new();
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
 fn init_mair() {
@@ -922,6 +981,8 @@ unsafe fn set_page_table() {
     // Contains our kernel RAM.
     PAGE_TABLE_L1_LOW.entries[1] =
         PageTableEntry::new_table(&raw const PAGE_TABLE_L2_RAM);
+    PAGE_TABLE_L1_LOW.entries[2] = 
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L2_VMAP);
 
     // ========================================================
     // L2: devices
@@ -938,17 +999,24 @@ unsafe fn set_page_table() {
     // ========================================================
     // L2: RAM
     // ========================================================
-
-    // 0x40000000..0x401FFFFF
-    // AP = 0b11 (EL1 read-only), not writable; keeps it executable.
-    map_ram();
-
-}
-unsafe fn map_ram() {
-    for i in 0..256 {
+    PAGE_TABLE_L2_RAM.entries[0] =
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L3);
+    for i in 1..256 {
         PAGE_TABLE_L2_RAM.entries[i] =
             PageTableEntry::new_block(
                 0x4000_0000 + i * 0x20_0000,
+                ATTR_NORMAL,
+                0b00,
+                0b11,
+                false,
+            );
+    }
+    PAGE_TABLE_L2_VMAP.entries[0] = 
+        PageTableEntry::new_table(&raw const PAGE_TABLE_L3_VMAP);
+    for i in 0..512 {
+        PAGE_TABLE_L3.entries[i] =
+            PageTableEntry::new_page(
+                0x4000_0000 + i * PAGE_SIZE,
                 ATTR_NORMAL,
                 0b00,
                 0b11,
