@@ -42,6 +42,43 @@ impl Write for Uart {
         Ok(())
     }
 }
+
+// ============================================================
+// Userspace print
+// ============================================================
+
+struct Stdout;
+impl Write for Stdout {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        syscall_print(s);
+        Ok(())
+    }
+}
+fn syscall_print(s: &str) {
+    unsafe{
+        core::arch::asm!(
+            "svc #3",
+            in("x0") s.as_ptr(),
+            in("x1") s.len(),
+        );
+    }
+}
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut stdout = Stdout;
+        stdout.write_fmt(format_args!($($arg)*)).unwrap();
+    }};
+}
+macro_rules! println {
+    () => {
+        print!("\n");
+    };
+    ($($arg:tt)*) => {
+        print!("{}\n", format_args!($($arg)*));
+    };
+}
+
 // ============================================================
 // Exception vector
 // ============================================================
@@ -733,9 +770,7 @@ fn idle_task() {
 // User test tasks
 // ============================================================
 extern "C" fn user_test() -> ! {
-    unsafe {
-        core::arch::asm!("svc #42");
-    }
+    println!("Userspace question.");
 
     loop {
         yield_now();
@@ -1533,9 +1568,16 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 }
                 panic!("SVC #2 with no scheduler");
             },
-            42 => {
-                writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
-                return;
+            3 => {
+                let ptr = frame.x[0] as usize;
+                let len = frame.x[1] as usize;
+                unsafe{
+                    let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                    let mut uart = Uart::new(0x0900_0000);
+                    let s = core::str::from_utf8(bytes).unwrap();
+                    uart.write_str(s);
+                    return;
+                }
             }
             _ => {}
         }
