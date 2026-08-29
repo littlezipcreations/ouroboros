@@ -732,14 +732,15 @@ fn idle_task() {
 // ============================================================
 // User test tasks
 // ============================================================
+extern "C" fn user_test() -> ! {
+    unsafe {
+        core::arch::asm!("svc #42");
+    }
 
-#[unsafe(no_mangle)]
-extern "C" fn user_test() -> !{
-    loop{
-        core::hint::spin_loop();
+    loop {
+        yield_now();
     }
 }
-
 // ============================================================
 // Scheduler
 // ============================================================
@@ -758,6 +759,9 @@ impl Scheduler {
     }
     fn add_task(&mut self, entry: fn()) -> usize {
         self.tasks.create(entry)
+    }
+    fn add_user_task(&mut self, entry: extern "C" fn() -> !) -> usize {
+        self.tasks.create_user(entry)
     }
     fn next_ready(&self) -> Option<usize> {
         if self.tasks.count <= 1 {
@@ -1529,6 +1533,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 }
                 panic!("SVC #2 with no scheduler");
             },
+            42 => {
+                writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
+                return;
+            }
             _ => {}
         }
     }
@@ -1695,6 +1703,7 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_a);
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
+            scheduler.add_user_task(user_test);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
