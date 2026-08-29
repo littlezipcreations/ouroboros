@@ -6,6 +6,7 @@ use exception::ExceptionFrame;
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
 use core::fmt::{self, Write};
+use core::ops::Add;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -76,12 +77,59 @@ struct CpuContext {
     pc: u64,
     spsr: u64,
 }
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct AddressSpace {
+    l0: PageTable,
+    l1: PageTable,
+    l2_device: PageTable,
+    l2_ram: PageTable,
+    l2_vmap: PageTable,
+    l3_ram: PageTable,
+    l3_vmap: PageTable,
+}
+impl AddressSpace {
+    const fn new() -> Self {
+        Self{ 
+            l0: PageTable::new(),
+            l1: PageTable::new(),
+            l2_device: PageTable::new(),
+            l2_ram: PageTable::new(),
+            l2_vmap: PageTable::new(),
+            l3_ram: PageTable::new(),
+            l3_vmap: PageTable::new(),
+        }
+    }
+    unsafe fn init(&mut self){
+        self.l0.entries[0] = PageTableEntry::new_table(&raw const self.l1);
+        self.l1.entries[0] = PageTableEntry::new_table(&raw const self.l2_device);
+        self.l1.entries[1] = PageTableEntry::new_table(&raw const self.l2_ram);
+        self.l1.entries[2] = PageTableEntry::new_table(&raw const self.l2_vmap);
+        self.l2_device.entries[64] = PageTableEntry::new_block(0x0800_0000, ATTR_DEVICE, 0b00, 0b10, true,);
+        self.l2_device.entries[72] = PageTableEntry::new_block(0x0900_0000, ATTR_DEVICE, 0b00, 0b10, true);
+        self.l2_ram.entries[0] = PageTableEntry::new_table(&raw const self.l3_ram);
+        for i in 1..256{
+            self.l2_ram.entries[i] = PageTableEntry::new_block(0x4000_0000 + i * 0x20_0000, ATTR_NORMAL, 0b00, 0b11, false);
+        }
+        self.l2_vmap.entries[0] = PageTableEntry::new_table(&raw const self.l3_vmap);
+        for i in 0..512{
+            self.l3_ram.entries[i] = PageTableEntry::new_page(0x4000_0000 + i * PAGE_SIZE, ATTR_NORMAL, 0b00, 0b11, false);
+        }
+    }
+
+}
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".address_spaces")]
+static mut ADDRESS_SPACES: [AddressSpace; MAX_TASKS] = [const { AddressSpace::new()}; MAX_TASKS];
+static mut CURRENT_ASID: usize = 0;
 #[repr(C)]
 struct Task {
     id: usize,
     state: TaskState,
     context: CpuContext,
+    address_space_id: usize,
 }
+const SPSR_EL0T: u64 = 0b0000;
 const SPSR_EL1H: u64 = 0b0101;
 #[repr(align(16))]
 #[derive(Copy, Clone)]
@@ -90,19 +138,29 @@ struct TaskStack([u8; TASK_STACK_SIZE]);
 #[unsafe(link_section = ".task_stacks")]
 static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
     [TaskStack([0; TASK_STACK_SIZE]); MAX_TASKS];
+const USER_STACK_TOP: u64 = 0x0000_0000_9000_0000;
+const USER_STACK_SIZE: usize = 16 * 1024;
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
+        unsafe {
+            ADDRESS_SPACES[id].init();
+        }
+
         let stack_bottom;
         let stack_top;
+
         unsafe {
             stack_bottom = TASK_STACKS[id].0.as_ptr() as u64;
             stack_top = stack_bottom + TASK_STACK_SIZE as u64;
         }
+
         let stack_top = stack_top & !0xF;
         let initial_sp = stack_top - 16;
+
         let mut task = Self {
             id,
             state: TaskState::Ready,
+            address_space_id: id,
             context: CpuContext {
                 x: [0; 31],
                 sp: initial_sp,
@@ -110,11 +168,32 @@ impl Task {
                 spsr: SPSR_EL1H,
             },
         };
+
         task.context.x[0] = entry as usize as u64;
         task.context.x[30] = task_exit as usize as u64;
         task.context.x[1..].fill(0);
+
         task
     }
+    fn new_user(id: usize, entry: extern "C" fn() -> !) -> Self{
+        unsafe {
+            ADDRESS_SPACES[id].init();
+        }
+        let stack_bottom;
+        let stack_top;
+        unsafe{
+            stack_bottom = TASK_STACKS[id].0.as_ptr() as u64;
+            stack_top = stack_bottom + TASK_STACK_SIZE as u64;
+        
+        let stack_top = stack_top & !0xF;
+        Self{
+            id,
+            state: TaskState::Ready,
+            address_space_id: id,
+            context: CpuContext { x: [0; 31], sp: stack_top, pc: entry as usize as u64, spsr: SPSR_EL0T }
+        }
+    }
+}
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
         self.context.sp = frame.sp;
@@ -145,6 +224,16 @@ impl TaskTable {
         }
         let id = self.count;
         self.tasks[id] = Some(Task::new(id, entry));
+        self.count += 1;
+        id
+    }
+    fn create_user(&mut self, entry: extern "C" fn() -> !) -> usize {
+        if self.count >= MAX_TASKS{
+            panic!("No free task slots");
+        }
+
+        let id = self.count;
+        self.tasks[id] = Some(Task::new_user(id, entry));
         self.count += 1;
         id
     }
@@ -181,9 +270,9 @@ fn task_a() { //RR test 1
         }
         a = a.wrapping_add(1);
         writeln!(uart, "A value = {:#x}", a).ok();
-        if a == 100 {
-            task_exit();
-        }
+        //if a == 100 {
+            //task_exit();
+        //}
     }
 }
 fn task_b() { //RR test 2
@@ -195,9 +284,9 @@ fn task_b() { //RR test 2
         }
         b = b.wrapping_add(1);
         writeln!(uart, "B value = {:#x}", b).ok();
-        if b == 2000 {
-            task_exit();
-        }
+        //if b == 2000 {
+           // task_exit();
+        //}
     }
 }
 fn task_c() { // RAM test
@@ -554,10 +643,12 @@ fn task_c() { // RAM test
 
         writeln!(uart, "").unwrap();
         writeln!(uart, "Testing VM allocator...").unwrap();
+        let asid = 1;
 
-        let a = vm_alloc_page();
-        let b = vm_alloc_page();
-        let c = vm_alloc_page();
+        let a = vm_alloc_page(asid);
+        let b = vm_alloc_page(asid);
+        let c = vm_alloc_page(asid);
+
 
         match (a, b, c) {
             (Some(a), Some(b), Some(c)) => {
@@ -587,10 +678,17 @@ fn task_c() { // RAM test
                 }
 
                 writeln!(uart, "PASS: mapped pages usable").unwrap();
-
+                writeln!(uart, "FREE A: start").unwrap();
                 vm_free_page(a);
+                writeln!(uart, "FREE A: done").unwrap();
+
+                writeln!(uart, "FREE B: start").unwrap();
                 vm_free_page(b);
+                writeln!(uart, "FREE B: done").unwrap();
+
+                writeln!(uart, "FREE C: start").unwrap();
                 vm_free_page(c);
+                writeln!(uart, "FREE C: done").unwrap();
 
                 writeln!(uart, "PASS: pages freed").unwrap();
             }
@@ -630,6 +728,18 @@ fn idle_task() {
         }
     }
 }
+
+// ============================================================
+// User test tasks
+// ============================================================
+
+#[unsafe(no_mangle)]
+extern "C" fn user_test() -> !{
+    loop{
+        core::hint::spin_loop();
+    }
+}
+
 // ============================================================
 // Scheduler
 // ============================================================
@@ -678,10 +788,8 @@ impl Scheduler {
         } else {
             self.current = 0;
         }
-        if let Some(task) = &mut self.tasks.tasks[self.current] {
-            task.state = TaskState::Running;
-            task.load_context(frame);
-        }
+        let id = self.current;
+        self.switch_to_task(self.current, frame);
     }
     fn tick(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
@@ -714,11 +822,7 @@ impl Scheduler {
                 0
             }
         };
-        self.current = next;
-        if let Some(task) = &mut self.tasks.tasks[next] {
-            task.state = TaskState::Running;
-            task.load_context(frame);
-        }
+        self.switch_to_task(next, frame);
     }
     fn yield_current(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count <= 1 {
@@ -742,11 +846,7 @@ impl Scheduler {
                 return;
             }
         };
-        self.current = next;
-        if let Some(task) = &mut self.tasks.tasks[next] {
-            task.state = TaskState::Running;
-            task.load_context(frame);
-        }
+        self.switch_to_task(next, frame);
     }
     fn exit_current(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
@@ -766,22 +866,39 @@ impl Scheduler {
             }
             if let Some(task) = &self.tasks.tasks[id] {
                 if task.state == TaskState::Ready {
-                    self.current = id;
-                    if let Some(task) = &mut self.tasks.tasks[id] {
-                        task.state = TaskState::Running;
-                        task.load_context(frame);
-                    }
+                    self.switch_to_task(id, frame);
                     return;
                 }
             }
         }
-        self.current = 0;
-        if let Some(idle) = &mut self.tasks.tasks[0] {
-            idle.state = TaskState::Running;
-            idle.load_context(frame);
+        self.switch_to_task(0, frame);
+    }
+    fn switch_to_task(
+        &mut self,
+        id: usize,
+        frame: &mut ExceptionFrame,
+    ) {
+        self.current = id;
+
+        let address_space_id = self.tasks.tasks[id]
+            .as_ref()
+            .unwrap()
+            .address_space_id;
+         unsafe {
+            CURRENT_ASID = address_space_id;
+        }   
+
+        if let Some(task) = &mut self.tasks.tasks[id] {
+            task.state = TaskState::Running;
+            task.load_context(frame);
+        }
+
+        unsafe {
+            switch_address_space(address_space_id);
         }
     }
 }
+
 // ============================================================
 // Scheduler storage
 // ============================================================
@@ -999,15 +1116,15 @@ fn free_virtual_page(address: usize){
     assert!(is_virtual_page_used(page));
     mark_virtual_page_free(page);
 }
-unsafe fn map_page(virt_addr: usize, phys_addr: usize){
+unsafe fn map_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize){
     assert!(virt_addr % PAGE_SIZE == 0);
     assert!(phys_addr % PAGE_SIZE == 0);
     assert!(virt_addr >= VMAP_START);
     assert!(virt_addr < VMAP_END);
 
     let index = (virt_addr >> 12) & 0x1FF;
-    assert!(!PAGE_TABLE_L3_VMAP.entries[index].is_valid());
-    PAGE_TABLE_L3_VMAP.entries[index] = 
+    assert!(!address_space.l3_vmap.entries[index].is_valid());
+    address_space.l3_vmap.entries[index] = 
         PageTableEntry::new_page(
             phys_addr,
             ATTR_NORMAL,
@@ -1016,13 +1133,13 @@ unsafe fn map_page(virt_addr: usize, phys_addr: usize){
             false
         )
 }
-unsafe fn unmap_page(virt_addr: usize) {
+unsafe fn unmap_page(address_space: &mut AddressSpace, virt_addr: usize) {
     assert!(virt_addr % PAGE_SIZE == 0);
     assert!(virt_addr >= VMAP_START);
     assert!(virt_addr < VMAP_END);
     let index = (virt_addr >> 12) & 0x1FF;
-    assert!(PAGE_TABLE_L3_VMAP.entries[index].is_valid());
-    PAGE_TABLE_L3_VMAP.entries[index] = PageTableEntry::invalid();
+    assert!(address_space.l3_vmap.entries[index].is_valid());
+    address_space.l3_vmap.entries[index] = PageTableEntry::invalid();
 }
 // ============================================================
 // Page tables
@@ -1076,6 +1193,7 @@ impl PageTableEntry {
     }
 }
 #[repr(C, align(4096))]
+#[derive(Clone, Copy)]
 struct PageTable {
     entries: [PageTableEntry; 512],
 }
@@ -1276,31 +1394,50 @@ fn enable_mmu() {
 // VM
 // ============================================================
 
-fn vm_alloc_page() -> Option<usize> {
+fn vm_alloc_page(address_space_id: usize) -> Option<usize> {
     let physical = alloc_page()?;
-    let virt_addr = match alloc_virtual_page(){
+
+    let virt_addr = match alloc_virtual_page() {
         Some(addr) => addr,
-        None =>{
+        None => {
             free_page(physical);
             return None;
         }
     };
-    unsafe{
-        map_page(virt_addr, physical);
-    }
-    Some(virt_addr)
 
+    unsafe {
+        let address_space = &mut ADDRESS_SPACES[address_space_id];
+
+        map_page(address_space, virt_addr, physical);
+    }
+
+    Some(virt_addr)
 }
 fn vm_free_page(virt_addr: usize){
     unsafe {
+        let address_space = &mut ADDRESS_SPACES[CURRENT_ASID];
         let index = (virt_addr >> 12) & 0x1FF;
-        assert!(PAGE_TABLE_L3_VMAP.entries[index].is_valid());
-        let entry = PAGE_TABLE_L3_VMAP.entries[index].0;
+        assert!(ADDRESS_SPACES[CURRENT_ASID].l3_vmap.entries[index].is_valid());
+        let entry = ADDRESS_SPACES[CURRENT_ASID].l3_vmap.entries[index].0;
         let phys_addr = (entry >> 12) << 12;
-        unmap_page(virt_addr);
+        unmap_page(address_space, virt_addr);
         free_virtual_page(virt_addr);
         free_page(phys_addr as usize);
     }
+}
+unsafe fn switch_address_space(id: usize) {
+    assert!(id < MAX_TASKS);
+
+    let table = &raw const ADDRESS_SPACES[id].l0 as *const PageTable as u64;
+
+    let asid = id as u64;
+    let ttbr0 = table | (asid << 48);
+
+    core::arch::asm!(
+        "msr ttbr0_el1, {0}",
+        "isb",
+        in(reg) ttbr0,
+    );
 }
 
 // ============================================================
@@ -1577,7 +1714,7 @@ pub extern "C" fn rust_start() -> ! {
         core::arch::asm!("msr daifclr, #2");
     }
     writeln!(uart, "CPU IRQs enabled!").unwrap();
-    writeln!(uart, "Scheduler has crashed! Loading to wfe").unwrap();
+    writeln!(uart, "Scheduler loaded, placeholder wfe").unwrap();
     loop {
         unsafe {
             core::arch::asm!("wfe");
