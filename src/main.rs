@@ -78,6 +78,39 @@ macro_rules! println {
         print!("{}\n", format_args!($($arg)*));
     };
 }
+// ============================================================
+// IPC syscalls
+// ============================================================
+
+pub fn ipc_send(recipient_id: usize, data: u64) -> bool {
+    let result: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #4",
+            in("x0") recipient_id,
+            in("x1") data,
+            lateout("x0") result,
+        );
+    }
+    result != 0
+}
+pub fn ipc_recv() -> Option<(u64, usize)> {
+    let data: u64;
+    let sender_id: u64;
+    unsafe{
+        core::arch::asm!(
+            "svc #5",
+            out("x0") data,
+            out("x1") sender_id,
+        );
+    }
+    if data == 0{
+        None
+    }
+    else {
+        Some((data, sender_id as usize))
+    }
+}
 
 // ============================================================
 // Exception vector
@@ -93,6 +126,42 @@ struct KernelStack([u8; 16 * 1024]);
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".kernel_stack")]
 static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
+// ============================================================
+// Message queue
+// ============================================================
+
+const IPC_QUEUE_SIZE: usize = 16;
+#[derive(Clone, Copy)]
+pub struct Message {
+    pub sender: usize,
+    pub data: u64,
+}
+pub struct MessageQueue{
+    buffer: [Message; IPC_QUEUE_SIZE],
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+impl MessageQueue{
+    pub const fn new() -> Self{
+        Self { buffer: [Message{ sender: 0, data: 0}; IPC_QUEUE_SIZE], head: 0, tail: 0, count: 0 }
+    }
+    pub fn send(&mut self, msg: Message) -> Result<(), ()> {
+        if self.count >= IPC_QUEUE_SIZE{ return Err(());}
+        self.buffer[self.tail] = msg;
+        self.tail = (self.tail + 1) % IPC_QUEUE_SIZE;
+        self.count += 1;
+        Ok(())
+    }
+    pub fn recv(&mut self) -> Option<Message> {
+        if self.count == 0 {return None;}
+        let msg = self.buffer[self.head];
+        self.head = (self.head + 1) % IPC_QUEUE_SIZE;
+        self.count -= 1;
+        Some(msg)
+    }
+}
+
 // ============================================================
 // Tasks
 // ============================================================
@@ -165,6 +234,7 @@ struct Task {
     state: TaskState,
     context: CpuContext,
     address_space_id: usize,
+    message_queue: MessageQueue,
 }
 const SPSR_EL0T: u64 = 0b0000;
 const SPSR_EL1H: u64 = 0b0101;
@@ -204,6 +274,7 @@ impl Task {
                 pc: task_trampoline as usize as u64,
                 spsr: SPSR_EL1H,
             },
+            message_queue: MessageQueue::new()
         };
 
         task.context.x[0] = entry as usize as u64;
@@ -227,7 +298,8 @@ impl Task {
             id,
             state: TaskState::Ready,
             address_space_id: id,
-            context: CpuContext { x: [0; 31], sp: stack_top, pc: entry as usize as u64, spsr: SPSR_EL0T }
+            context: CpuContext { x: [0; 31], sp: stack_top, pc: entry as usize as u64, spsr: SPSR_EL0T },
+            message_queue: MessageQueue::new()
         }
     }
 }
@@ -774,6 +846,34 @@ extern "C" fn user_test() -> ! {
 
     loop {
         yield_now();
+    }
+}
+// Producer: Sends incrementing numbers to the consumer.
+extern "C" fn producer_task() -> ! {
+    let mut uart = Uart::new(0x0900_0000);
+    let consumer_id = 2;  // Assume consumer is task ID 2
+    let mut counter = 0u64;
+
+    loop {
+        writeln!(uart, "Producer: Sending {}\n", counter).ok();
+        if ipc_send(consumer_id, counter) {
+            counter += 1;
+        } else {
+            writeln!(uart, "Producer: Queue full! Waiting...\n").ok();
+        }
+        yield_now();
+    }
+}
+
+// Consumer: Prints received messages.
+extern "C" fn consumer_task() -> ! {
+    let mut uart = Uart::new(0x0900_0000);
+    loop {
+        if let Some((data, sender_id)) = ipc_recv() {
+            writeln!(uart, "Consumer: Received {} from task {}\n", data, sender_id).ok();
+        } else {
+            yield_now();
+        }
     }
 }
 // ============================================================
@@ -1544,6 +1644,7 @@ fn decode_data_abort(esr: u64) {
 // ============================================================
 // Synchronous exceptions
 // ============================================================
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
     let mut uart = Uart::new(0x0900_0000);
@@ -1578,6 +1679,46 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     uart.write_str(s);
                     return;
                 }
+            },
+            4 => {
+                let recipient_id = frame.x[0] as usize;
+                let data = frame.x[1] as u64;
+                let sender_id = unsafe{
+                    let scheduler_ptr = &raw mut SCHEDULER;
+                    (*scheduler_ptr).as_ref().unwrap().current
+                };
+                if recipient_id >= MAX_TASKS {
+                    writeln!(uart, "IPC: Invalid recipient ID {}\n", recipient_id).ok();
+                    return;
+                }
+                unsafe{
+                    let scheduler_ptr = &raw mut SCHEDULER;
+                    if let Some(scheduler) = (*scheduler_ptr).as_mut(){
+                        if let Some(recipient) = &mut scheduler.tasks.tasks[recipient_id]{
+                            let msg = Message{sender: sender_id, data};
+                            if recipient.message_queue.send(msg).is_err(){
+                                writeln!(uart, "IPC: QUEUE FULL FOR TASK {}", recipient_id).ok();
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            5 => {
+                unsafe{
+                    let scheduler_ptr = &raw mut SCHEDULER;
+                    if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+                        let current_task_id = scheduler.current;
+                        if let Some(current_task) = &mut scheduler.tasks.tasks[current_task_id]{
+                            if let Some(msg) = current_task.message_queue.recv(){
+                                frame.x[0] = msg.data;
+                                frame.x[1] = msg.sender as u64;
+                            } else {
+                                frame.x[0] = 0;                            }
+                        }
+                    }
+                }
+                return;
             }
             _ => {}
         }
@@ -1746,6 +1887,8 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
             scheduler.add_user_task(user_test);
+            //scheduler.add_user_task(producer_task);
+            //scheduler.add_user_task(consumer_task);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
