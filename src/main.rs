@@ -55,11 +55,12 @@ impl Write for Stdout {
     }
 }
 fn syscall_print(s: &str) {
-    unsafe{
+    unsafe {
         core::arch::asm!(
             "svc #3",
             in("x0") s.as_ptr(),
             in("x1") s.len(),
+            options(nostack),
         );
     }
 }
@@ -84,30 +85,34 @@ macro_rules! println {
 
 pub fn ipc_send(recipient_id: usize, data: u64) -> bool {
     let result: u64;
+
     unsafe {
         core::arch::asm!(
             "svc #4",
-            in("x0") recipient_id,
+            inlateout("x0") recipient_id as u64 => result,
             in("x1") data,
-            lateout("x0") result,
         );
     }
+
     result != 0
 }
 pub fn ipc_recv() -> Option<(u64, usize)> {
     let data: u64;
     let sender_id: u64;
-    unsafe{
+    let success: u64;
+
+    unsafe {
         core::arch::asm!(
             "svc #5",
             out("x0") data,
             out("x1") sender_id,
+            out("x2") success,
         );
     }
-    if data == 0{
+
+    if success == 0 {
         None
-    }
-    else {
+    } else {
         Some((data, sender_id as usize))
     }
 }
@@ -166,7 +171,7 @@ impl MessageQueue{
 // Tasks
 // ============================================================
 const TASK_STACK_SIZE: usize = 16 * 1024;
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 128;
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskState {
@@ -245,8 +250,30 @@ struct TaskStack([u8; TASK_STACK_SIZE]);
 #[unsafe(link_section = ".task_stacks")]
 static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
     [TaskStack([0; TASK_STACK_SIZE]); MAX_TASKS];
-const USER_STACK_TOP: u64 = 0x0000_0000_9000_0000;
-const USER_STACK_SIZE: usize = 16 * 1024;
+const USER_STACK_TOP: usize = VMAP_END;
+const USER_STACK_PAGES: usize = 16;
+const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
+const USER_STACK_BOTTOM: usize = USER_STACK_TOP - USER_STACK_SIZE;
+fn create_user_stack(address_space_id: usize) -> usize {
+    unsafe {
+        let address_space = &mut ADDRESS_SPACES[address_space_id];
+
+        for i in 0..USER_STACK_PAGES {
+            let physical = alloc_page().expect("Out of physical memory");
+
+            let virtual_address =
+                USER_STACK_BOTTOM + i * PAGE_SIZE;
+
+            map_page(
+                address_space,
+                virtual_address,
+                physical,
+            );
+        }
+    }
+
+    USER_STACK_TOP
+}
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -283,26 +310,32 @@ impl Task {
 
         task
     }
-    fn new_user(id: usize, entry: extern "C" fn() -> !) -> Self{
+    fn new_user(id: usize, entry: extern "C" fn() -> !) -> Self {
         unsafe {
             ADDRESS_SPACES[id].init();
         }
-        let stack_bottom;
-        let stack_top;
-        unsafe{
-            stack_bottom = TASK_STACKS[id].0.as_ptr() as u64;
-            stack_top = stack_bottom + TASK_STACK_SIZE as u64;
-        
-        let stack_top = stack_top & !0xF;
-        Self{
+
+        let stack_top = create_user_stack(id) as u64;
+
+        Self {
             id,
             state: TaskState::Ready,
             address_space_id: id,
-            context: CpuContext { x: [0; 31], sp: stack_top, pc: entry as usize as u64, spsr: SPSR_EL0T },
-            message_queue: MessageQueue::new()
+
+            context: CpuContext {
+                x: [0; 31],
+
+                // EL0 stack
+                sp: stack_top & !0xF,
+
+                pc: entry as usize as u64,
+
+                spsr: SPSR_EL0T,
+            },
+
+            message_queue: MessageQueue::new(),
         }
     }
-}
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
         self.context.sp = frame.sp;
@@ -850,27 +883,26 @@ extern "C" fn user_test() -> ! {
 }
 // Producer: Sends incrementing numbers to the consumer.
 extern "C" fn producer_task() -> ! {
-    let mut uart = Uart::new(0x0900_0000);
-    let consumer_id = 2;  // Assume consumer is task ID 2
+    println!("Entered producer task");
+    let consumer_id = 4;  // Assume consumer is task ID 2
     let mut counter = 0u64;
 
     loop {
-        writeln!(uart, "Producer: Sending {}\n", counter).ok();
+        println!("Producer: Sending {}", counter);
         if ipc_send(consumer_id, counter) {
             counter += 1;
         } else {
-            writeln!(uart, "Producer: Queue full! Waiting...\n").ok();
+            println!("Producer: Queue full! Waiting...");
         }
         yield_now();
     }
 }
 
 // Consumer: Prints received messages.
-extern "C" fn consumer_task() -> ! {
-    let mut uart = Uart::new(0x0900_0000);
+extern "C" fn consumer_task() -> ! { 
     loop {
         if let Some((data, sender_id)) = ipc_recv() {
-            writeln!(uart, "Consumer: Received {} from task {}\n", data, sender_id).ok();
+            println!("Consumer: Received {} from task {}\n", data, sender_id);
         } else {
             yield_now();
         }
@@ -1017,6 +1049,7 @@ impl Scheduler {
         id: usize,
         frame: &mut ExceptionFrame,
     ) {
+        let mut uart = Uart::new(0x0900_0000);
         self.current = id;
 
         let address_space_id = self.tasks.tasks[id]
@@ -1029,6 +1062,14 @@ impl Scheduler {
 
         if let Some(task) = &mut self.tasks.tasks[id] {
             task.state = TaskState::Running;
+            writeln!(uart,
+                "SWITCH: id={} pc={:#018x} sp={:#018x} spsr={:#018x} asid={}",
+                id,
+                task.context.pc,
+                task.context.sp,
+                task.context.spsr,
+                task.address_space_id,
+            );
             task.load_context(frame);
         }
 
@@ -1682,42 +1723,111 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
             },
             4 => {
                 let recipient_id = frame.x[0] as usize;
-                let data = frame.x[1] as u64;
-                let sender_id = unsafe{
-                    let scheduler_ptr = &raw mut SCHEDULER;
-                    (*scheduler_ptr).as_ref().unwrap().current
-                };
-                if recipient_id >= MAX_TASKS {
-                    writeln!(uart, "IPC: Invalid recipient ID {}\n", recipient_id).ok();
-                    return;
+                let data = frame.x[1];
+
+                let scheduler_ptr = &raw mut SCHEDULER;
+
+                unsafe {
+                    let scheduler = match (*scheduler_ptr).as_mut() {
+                        Some(scheduler) => scheduler,
+                        None => {
+                            frame.x[0] = 0;
+                            return;
+                        }
+                    };
+
+                    let sender_id = scheduler.current;
+
+                    // Invalid task ID.
+                    if recipient_id >= MAX_TASKS {
+                        writeln!(
+                            uart,
+                            "IPC: Invalid recipient ID {}",
+                            recipient_id
+                        ).ok();
+
+                        frame.x[0] = 0;
+                        return;
+                    }
+
+                    // Recipient doesn't exist.
+                    let recipient = match &mut scheduler.tasks.tasks[recipient_id] {
+                        Some(task) => task,
+                        None => {
+                            writeln!(
+                                uart,
+                                "IPC: Recipient {} does not exist",
+                                recipient_id
+                            ).ok();
+
+                            frame.x[0] = 0;
+                            return;
+                        }
+                    };
+
+                    // Don't send to a dead/unused task.
+                    if recipient.state == TaskState::Dead ||
+                    recipient.state == TaskState::Unused
+                    {
+                        writeln!(
+                            uart,
+                            "IPC: Recipient {} is not alive",
+                            recipient_id
+                        ).ok();
+
+                        frame.x[0] = 0;
+                        return;
+                    }
+
+                    let msg = Message {
+                        sender: sender_id,
+                        data,
+                    };
+
+                    match recipient.message_queue.send(msg) {
+                        Ok(()) => {
+                            // Return true to userspace.
+                            frame.x[0] = 1;
+                        }
+
+                        Err(()) => {
+                            writeln!(
+                                uart,
+                                "IPC: QUEUE FULL FOR TASK {}",
+                                recipient_id
+                            ).ok();
+
+                            // Return false to userspace.
+                            frame.x[0] = 0;
+                        }
+                    }
                 }
-                unsafe{
+
+                return;
+            }
+            5 => {
+                unsafe {
                     let scheduler_ptr = &raw mut SCHEDULER;
-                    if let Some(scheduler) = (*scheduler_ptr).as_mut(){
-                        if let Some(recipient) = &mut scheduler.tasks.tasks[recipient_id]{
-                            let msg = Message{sender: sender_id, data};
-                            if recipient.message_queue.send(msg).is_err(){
-                                writeln!(uart, "IPC: QUEUE FULL FOR TASK {}", recipient_id).ok();
+
+                    if let Some(scheduler) = (*scheduler_ptr).as_mut() {
+                        let current_task_id = scheduler.current;
+
+                        if let Some(current_task) =
+                            &mut scheduler.tasks.tasks[current_task_id]
+                        {
+                            if let Some(msg) = current_task.message_queue.recv() {
+                                frame.x[0] = msg.data;
+                                frame.x[1] = msg.sender as u64;
+                                frame.x[2] = 1;
+                            } else {
+                                frame.x[0] = 0;
+                                frame.x[1] = 0;
+                                frame.x[2] = 0;
                             }
                         }
                     }
                 }
-                return;
-            }
-            5 => {
-                unsafe{
-                    let scheduler_ptr = &raw mut SCHEDULER;
-                    if let Some(scheduler) = (*scheduler_ptr).as_mut() {
-                        let current_task_id = scheduler.current;
-                        if let Some(current_task) = &mut scheduler.tasks.tasks[current_task_id]{
-                            if let Some(msg) = current_task.message_queue.recv(){
-                                frame.x[0] = msg.data;
-                                frame.x[1] = msg.sender as u64;
-                            } else {
-                                frame.x[0] = 0;                            }
-                        }
-                    }
-                }
+
                 return;
             }
             _ => {}
@@ -1887,8 +1997,8 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
             scheduler.add_user_task(user_test);
-            //scheduler.add_user_task(producer_task);
-            //scheduler.add_user_task(consumer_task);
+            scheduler.add_user_task(producer_task);
+            scheduler.add_user_task(consumer_task);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
@@ -1908,7 +2018,7 @@ pub extern "C" fn rust_start() -> ! {
         core::arch::asm!("msr daifclr, #2");
     }
     writeln!(uart, "CPU IRQs enabled!").unwrap();
-    writeln!(uart, "Scheduler loaded, placeholder wfe").unwrap();
+    writeln!(uart, "Scheduler loaded, placeholder wfe...").unwrap();
     loop {
         unsafe {
             core::arch::asm!("wfe");
