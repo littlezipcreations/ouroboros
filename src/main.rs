@@ -141,6 +141,7 @@ static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
 const USER_STACK_TOP: u64 = 0x0000_0000_8020_0000;
 const USER_STACK_SIZE: usize = 16 * 1024;
 const USER_CODE_BASE: usize = 0x8000_0000;
+static USER_INIT: &[u8] = include_bytes!("../user-init/user-init.bin");
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -179,6 +180,25 @@ impl Task {
     fn new_user(id: usize, entry: u64) -> Self{
         unsafe{
             ADDRESS_SPACES[id].init();
+        }
+        assert!(USER_INIT.len() <= PAGE_SIZE);
+
+        let physical = alloc_page()
+            .expect("Failed to allocate page for user code");
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                USER_INIT.as_ptr(),
+                physical as *mut u8,
+                USER_INIT.len(),
+            );
+
+            map_user_page(
+                &mut ADDRESS_SPACES[id],
+                USER_CODE_BASE,
+                physical,
+                true,
+            );
         }
         let stack_top = USER_STACK_TOP;
         for i in 0..(USER_STACK_SIZE / PAGE_SIZE){
@@ -1742,6 +1762,7 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
             //scheduler.add_user_task(user_test);
+            scheduler.add_user_task(USER_CODE_BASE as u64);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();
