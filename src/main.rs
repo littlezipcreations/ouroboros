@@ -138,8 +138,9 @@ struct TaskStack([u8; TASK_STACK_SIZE]);
 #[unsafe(link_section = ".task_stacks")]
 static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
     [TaskStack([0; TASK_STACK_SIZE]); MAX_TASKS];
-const USER_STACK_TOP: u64 = 0x0000_0000_9000_0000;
+const USER_STACK_TOP: u64 = 0x0000_0000_8020_0000;
 const USER_STACK_SIZE: usize = 16 * 1024;
+const USER_CODE_BASE: usize = 0x8000_0000;
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -175,25 +176,33 @@ impl Task {
 
         task
     }
-    fn new_user(id: usize, entry: extern "C" fn() -> !) -> Self{
-        unsafe {
+    fn new_user(id: usize, entry: u64) -> Self{
+        unsafe{
             ADDRESS_SPACES[id].init();
         }
-        let stack_bottom;
-        let stack_top;
-        unsafe{
-            stack_bottom = TASK_STACKS[id].0.as_ptr() as u64;
-            stack_top = stack_bottom + TASK_STACK_SIZE as u64;
-        
-        let stack_top = stack_top & !0xF;
-        Self{
-            id,
-            state: TaskState::Ready,
-            address_space_id: id,
-            context: CpuContext { x: [0; 31], sp: stack_top, pc: entry as usize as u64, spsr: SPSR_EL0T }
+        let stack_top = USER_STACK_TOP;
+        for i in 0..(USER_STACK_SIZE / PAGE_SIZE){
+            let physical = alloc_page().expect("Failed to allocate page for user stack");
+            let virtual_address = USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
+            unsafe {
+                map_user_page(
+                    &mut ADDRESS_SPACES[id], virtual_address, physical, false
+                );
+            }
         }
+        Self {
+        id,
+        state: TaskState::Ready,
+        address_space_id: id,
+
+        context: CpuContext {
+            x: [0; 31],
+            sp: stack_top,
+            pc: entry as usize as u64,
+            spsr: SPSR_EL0T,
+        },
     }
-}
+    }
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
         self.context.sp = frame.sp;
@@ -227,8 +236,8 @@ impl TaskTable {
         self.count += 1;
         id
     }
-    fn create_user(&mut self, entry: extern "C" fn() -> !) -> usize {
-        if self.count >= MAX_TASKS{
+    fn create_user(&mut self, entry: u64) -> usize {
+        if self.count >= MAX_TASKS {
             panic!("No free task slots");
         }
 
@@ -760,7 +769,7 @@ impl Scheduler {
     fn add_task(&mut self, entry: fn()) -> usize {
         self.tasks.create(entry)
     }
-    fn add_user_task(&mut self, entry: extern "C" fn() -> !) -> usize {
+    fn add_user_task(&mut self, entry: u64) -> usize {
         self.tasks.create_user(entry)
     }
     fn next_ready(&self) -> Option<usize> {
@@ -1136,6 +1145,35 @@ unsafe fn map_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr
             0b11,
             false
         )
+}
+unsafe fn map_user_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize, executable: bool){
+    assert!(virt_addr % PAGE_SIZE == 0);
+    assert!(phys_addr % PAGE_SIZE == 0);
+    assert!(virt_addr >= VMAP_START);
+    assert!(virt_addr < VMAP_END);
+    let index = (virt_addr >> 12) & 0x1FF;
+    assert!(!address_space.l3_vmap.entries[index].is_valid());
+    address_space.l3_vmap.entries[index] =
+        PageTableEntry::new_page(
+            phys_addr, ATTR_NORMAL, 0b01, 0b11, !executable
+        );
+}
+unsafe fn map_user_stack(address_space: &mut AddressSpace) -> usize {
+    let stack_bottom = USER_STACK_TOP as usize - USER_STACK_SIZE as usize;
+
+    for i in 0..(USER_STACK_SIZE / PAGE_SIZE) {
+        let phys_addr = alloc_page().expect("Out of physical memory");
+        let virt_addr = stack_bottom + i * PAGE_SIZE;
+
+        map_user_page(
+            address_space,
+            virt_addr,
+            phys_addr,
+            false,
+        );
+    }
+
+    USER_STACK_TOP as usize
 }
 unsafe fn unmap_page(address_space: &mut AddressSpace, virt_addr: usize) {
     assert!(virt_addr % PAGE_SIZE == 0);
@@ -1703,7 +1741,7 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_a);
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
-            scheduler.add_user_task(user_test);
+            //scheduler.add_user_task(user_test);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();

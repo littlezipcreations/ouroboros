@@ -1,2 +1,4 @@
 /target
 qemu.log
+qemu-debug.log
+.vscode/settings.json
