@@ -142,7 +142,7 @@ static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
 const USER_STACK_TOP: u64 = 0x0000_0000_8020_0000;
 const USER_STACK_SIZE: usize = 16 * 1024;
 const USER_CODE_BASE: usize = 0x8000_0000;
-const USER_HEAP_START: usize = 0x8001_0000;
+const USER_HEAP_START: usize = 0x8010_0000;
 const USER_HEAP_END: usize = USER_STACK_TOP as usize - USER_STACK_SIZE;
 static mut USER_HEAP_NEXT: [usize; MAX_TASKS] = [USER_HEAP_START; MAX_TASKS];
 static USER_INIT: &[u8] = include_bytes!("../user-init/user-init.bin");
@@ -1657,6 +1657,86 @@ unsafe fn switch_address_space(id: usize) {
         in(reg) ttbr0,
     );
 }
+fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
+    if pages == 0 {
+        return None;
+    }
+
+    let bytes = pages.checked_mul(PAGE_SIZE)?;
+
+    let start = unsafe {
+        USER_HEAP_NEXT[address_space_id]
+    };
+
+    let end = start.checked_add(bytes)?;
+
+    if start < USER_HEAP_START || end > USER_HEAP_END {
+        return None;
+    }
+
+    let mut mapped = 0;
+
+    while mapped < pages {
+        let physical = match alloc_page() {
+            Some(address) => address,
+            None => break,
+        };
+
+        let virtual_address = start + mapped * PAGE_SIZE;
+
+        unsafe {
+            map_user_page(
+                &mut ADDRESS_SPACES[address_space_id],
+                virtual_address,
+                physical,
+                false,
+            );
+        }
+
+        mapped += 1;
+    }
+
+    if mapped != pages {
+        // Roll back the pages we successfully mapped.
+        //
+        // These heap virtual addresses are managed by USER_HEAP_NEXT,
+        // not by the global VMAP_BITMAP, so do not call
+        // free_virtual_page() here.
+        unsafe {
+            let address_space = &mut ADDRESS_SPACES[address_space_id];
+
+            for i in 0..mapped {
+                let virtual_address = start + i * PAGE_SIZE;
+                let index = (virtual_address >> 12) & 0x1FF;
+
+                let entry = address_space.l3_vmap.entries[index].0;
+                let physical =
+                    ((entry >> 12) << 12) as usize;
+
+                unmap_page(
+                    address_space,
+                    virtual_address,
+                );
+
+                free_page(physical);
+            }
+
+            core::arch::asm!("dsb sy", "isb");
+        }
+
+        return None;
+    }
+
+    unsafe {
+        USER_HEAP_NEXT[address_space_id] = end;
+
+        // Ensure the new page-table entries are visible before
+        // returning to EL0.
+        core::arch::asm!("dsb sy", "isb");
+    }
+
+    Some(start)
+}
 // ============================================================
 // Exception decoding
 // ============================================================
@@ -1768,6 +1848,20 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     uart.put_byte(byte);
                 }
                 frame.x[0] = len as u64;
+                return;
+            }
+            4 => {
+                let pages = frame.x[0] as usize;
+                let address_space_id = unsafe { CURRENT_ASID };
+
+                frame.x[0] = match alloc_user_pages(
+                    address_space_id,
+                    pages,
+                ) {
+                    Some(address) => address as u64,
+                    None => 0,
+                };
+
                 return;
             }
             42 => {
