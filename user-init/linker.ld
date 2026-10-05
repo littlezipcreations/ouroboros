@@ -5,7 +5,7 @@ SECTIONS
 
     .text : ALIGN(16)
     {
-        KEEP(*(text._start))
+        KEEP(*(.text._start))
         *(.text*)
     }
     .rodata : ALIGN(16){
@@ -26,6 +26,7 @@ SECTIONS
     /DISCARD/ :
     {
         *(.eh_frame)
+        *(.eh_frame_hdr)
         *(.comment)
     }
 }

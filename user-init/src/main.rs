@@ -5,6 +5,7 @@ mod syscall;
 use core::panic::PanicInfo;
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start() -> ! {
     syscall::test();
     for _ in 0..10{

@@ -6,4 +6,5 @@ pub struct ExceptionFrame {
     pub spsr: u64,
     pub esr: u64,
     pub far: u64,
+    pub kernel_sp: u64,
 }
