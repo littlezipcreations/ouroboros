@@ -35,10 +35,32 @@ pub extern "C" fn _start() -> ! {
 
     writeln!(
         &mut stdout,
-        "Hello from Ouroboros userspace!"
+        "================================"
     ).unwrap();
 
-    let message = String::from("Hello from a heap!");
+    writeln!(
+        &mut stdout,
+        "   OUROBOROS .RUN TEST"
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "================================"
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "Hello from a .run executable!"
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "Formatting: {} {:#x}",
+        42,
+        0xdead_beef_u64
+    ).unwrap();
+
+    let message = String::from("String allocation works");
 
     writeln!(
         &mut stdout,
@@ -68,13 +90,29 @@ pub extern "C" fn _start() -> ! {
 
     writeln!(
         &mut stdout,
-        "Vec[999]: {}",
+        "Vec[0] = {}",
+        numbers[0]
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "Vec[999] = {}",
         numbers[999]
     ).unwrap();
 
     writeln!(
         &mut stdout,
-        "HEAP WORKS."
+        "================================"
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "        .RUN WORKS!"
+    ).unwrap();
+
+    writeln!(
+        &mut stdout,
+        "================================"
     ).unwrap();
 
     loop {

@@ -142,10 +142,181 @@ static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
 const USER_STACK_TOP: u64 = 0x0000_0000_8020_0000;
 const USER_STACK_SIZE: usize = 16 * 1024;
 const USER_CODE_BASE: usize = 0x8000_0000;
-const USER_HEAP_START: usize = 0x8010_0000;
+const USER_HEAP_START: usize = 0x8001_0000;
 const USER_HEAP_END: usize = USER_STACK_TOP as usize - USER_STACK_SIZE;
 static mut USER_HEAP_NEXT: [usize; MAX_TASKS] = [USER_HEAP_START; MAX_TASKS];
-static USER_INIT: &[u8] = include_bytes!("../user-init/user-init.bin");
+static USER_RUN: &[u8] = include_bytes!("../user-init/user-init.run");
+
+// ============================================================
+// Ouroboros .run executable format
+// ============================================================
+const RUN_MAGIC: &[u8; 4] = b"RUN1";
+const RUN_VERSION: u16 = 1;
+const RUN_ARCH_AARCH64: u16 = 1;
+const RUN_HEADER_SIZE: usize = 32;
+const RUN_SEGMENT_SIZE: usize = 48;
+const RUN_MAX_SEGMENTS: usize = 16;
+
+const RUN_R: u32 = 1;
+const RUN_W: u32 = 2;
+const RUN_X: u32 = 4;
+
+fn run_read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+    ])
+}
+
+fn run_read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}
+
+fn run_read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ])
+}
+
+fn run_align_up(value: usize) -> usize {
+    (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+fn load_run(address_space_id: usize) -> (u64, usize) {
+    let data = USER_RUN;
+
+    assert!(data.len() >= RUN_HEADER_SIZE, ".run header too small");
+    assert!(&data[0..4] == RUN_MAGIC, "invalid .run magic");
+
+    let version = run_read_u16(data, 4);
+    let architecture = run_read_u16(data, 6);
+    let header_size = run_read_u16(data, 8) as usize;
+    let segment_count = run_read_u16(data, 10) as usize;
+    let entry = run_read_u64(data, 12);
+    let image_size = run_read_u64(data, 24) as usize;
+
+    assert!(version == RUN_VERSION, "unsupported .run version");
+    assert!(architecture == RUN_ARCH_AARCH64, "unsupported .run architecture");
+    assert!(header_size == RUN_HEADER_SIZE, "invalid .run header size");
+    assert!(segment_count <= RUN_MAX_SEGMENTS, "too many .run segments");
+    assert!(image_size == data.len(), ".run image size mismatch");
+
+    let table_end = header_size
+        .checked_add(segment_count * RUN_SEGMENT_SIZE)
+        .expect(".run segment table overflow");
+    assert!(table_end <= data.len(), ".run segment table outside file");
+
+    assert!(entry >= VMAP_START as u64);
+    assert!(entry < VMAP_END as u64);
+
+    // Keep segment ranges around so overlapping segments are rejected.
+    let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
+    let mut range_count = 0usize;
+    let mut max_end = VMAP_START;
+
+    for i in 0..segment_count {
+        let base = header_size + i * RUN_SEGMENT_SIZE;
+
+        let virtual_address = run_read_u64(data, base) as usize;
+        let file_offset = run_read_u64(data, base + 8) as usize;
+        let file_size = run_read_u64(data, base + 16) as usize;
+        let memory_size = run_read_u64(data, base + 24) as usize;
+        let flags = run_read_u32(data, base + 32);
+        let _alignment = run_read_u32(data, base + 36);
+
+        assert!(memory_size != 0, ".run segment has zero memory size");
+        assert!(file_size <= memory_size, ".run file size exceeds memory size");
+        assert!(virtual_address % PAGE_SIZE == 0, ".run segment is not page-aligned");
+
+        let segment_end = virtual_address
+            .checked_add(memory_size)
+            .expect(".run segment address overflow");
+
+        assert!(virtual_address >= VMAP_START);
+        assert!(segment_end <= VMAP_END);
+
+        let file_end = file_offset
+            .checked_add(file_size)
+            .expect(".run file offset overflow");
+
+        assert!(file_end <= data.len(), ".run segment data outside file");
+
+        for j in 0..range_count {
+            let (other_start, other_end) = ranges[j];
+            assert!(
+                segment_end <= other_start || virtual_address >= other_end,
+                ".run segments overlap"
+            );
+        }
+
+        ranges[range_count] = (virtual_address, segment_end);
+        range_count += 1;
+
+        if segment_end > max_end {
+            max_end = segment_end;
+        }
+
+        let pages = run_align_up(memory_size) / PAGE_SIZE;
+        let writable = (flags & RUN_W) != 0;
+        let executable = (flags & RUN_X) != 0;
+
+        for page in 0..pages {
+            let virtual_page = virtual_address + page * PAGE_SIZE;
+            let physical = alloc_page().expect("out of physical memory loading .run");
+
+            unsafe {
+                core::ptr::write_bytes(
+                    physical as *mut u8,
+                    0,
+                    PAGE_SIZE,
+                );
+
+                let remaining_file = file_size.saturating_sub(page * PAGE_SIZE);
+                let copy_len = remaining_file.min(PAGE_SIZE);
+
+                if copy_len != 0 {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(file_offset + page * PAGE_SIZE),
+                        physical as *mut u8,
+                        copy_len,
+                    );
+                }
+
+                map_run_page(
+                    &mut ADDRESS_SPACES[address_space_id],
+                    virtual_page,
+                    physical,
+                    writable,
+                    executable,
+                );
+            }
+        }
+    }
+
+    assert!(range_count != 0, ".run contains no loadable segments");
+
+    let heap_start = run_align_up(max_end.max(USER_HEAP_START));
+    assert!(heap_start < USER_HEAP_END, ".run leaves no room for user heap/stack");
+
+    unsafe {
+        core::arch::asm!("dsb sy", "isb");
+    }
+
+    (entry, heap_start)
+}
+
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -182,63 +353,53 @@ impl Task {
 
         task
     }
-    fn new_user(id: usize, entry: u64) -> Self{
-        unsafe{
-            ADDRESS_SPACES[id].init();
-        }
+    fn new_user(id: usize) -> Self {
         unsafe {
+            ADDRESS_SPACES[id].init();
             USER_HEAP_NEXT[id] = USER_HEAP_START;
         }
-        let code_pages = (USER_INIT.len() + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        for i in 0..code_pages {
+        let (entry, heap_start) = load_run(id);
+
+        unsafe {
+            USER_HEAP_NEXT[id] = heap_start;
+        }
+
+        let stack_top = USER_STACK_TOP;
+
+        for i in 0..(USER_STACK_SIZE / PAGE_SIZE) {
             let physical = alloc_page()
-                .expect("Failed to allocate page for user code");
+                .expect("Failed to allocate page for user stack");
 
-            let offset = i * PAGE_SIZE;
-            let remaining = USER_INIT.len() - offset;
-            let copy_len = remaining.min(PAGE_SIZE);
+            let virtual_address =
+                USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
 
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    USER_INIT.as_ptr().add(offset),
-                    physical as *mut u8,
-                    copy_len,
-                );
-
                 map_user_page(
                     &mut ADDRESS_SPACES[id],
-                    USER_CODE_BASE + offset,
+                    virtual_address,
                     physical,
-                    true,
+                    false,
                 );
             }
         }
-        let stack_top = USER_STACK_TOP;
-        for i in 0..(USER_STACK_SIZE / PAGE_SIZE){
-            let physical = alloc_page().expect("Failed to allocate page for user stack");
-            let virtual_address = USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
-            unsafe {
-                map_user_page(
-                    &mut ADDRESS_SPACES[id], virtual_address, physical, false
-                );
-            }
-        }
+
         let kernel_stack_top = unsafe {
             TASK_STACKS[id].0.as_ptr() as u64 + TASK_STACK_SIZE as u64
         };
+
         Self {
-        id,
-        state: TaskState::Ready,
-        address_space_id: id,
-        context: CpuContext {
-            x: [0; 31],
-            sp: stack_top,
-            pc: entry as usize as u64,
-            spsr: SPSR_EL0T,
-            kernel_sp: kernel_stack_top
-        },
-    }
+            id,
+            state: TaskState::Ready,
+            address_space_id: id,
+            context: CpuContext {
+                x: [0; 31],
+                sp: stack_top,
+                pc: entry,
+                spsr: SPSR_EL0T,
+                kernel_sp: kernel_stack_top,
+            },
+        }
     }
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
@@ -273,13 +434,13 @@ impl TaskTable {
         self.count += 1;
         id
     }
-    fn create_user(&mut self, entry: u64) -> usize {
+    fn create_user(&mut self) -> usize {
         if self.count >= MAX_TASKS {
             panic!("No free task slots");
         }
 
         let id = self.count;
-        self.tasks[id] = Some(Task::new_user(id, entry));
+        self.tasks[id] = Some(Task::new_user(id));
         self.count += 1;
         id
     }
@@ -943,8 +1104,8 @@ impl Scheduler {
     fn add_task(&mut self, entry: fn()) -> usize {
         self.tasks.create(entry)
     }
-    fn add_user_task(&mut self, entry: u64) -> usize {
-        self.tasks.create_user(entry)
+    fn add_user_task(&mut self) -> usize {
+        self.tasks.create_user()
     }
     fn next_ready(&self) -> Option<usize> {
         if self.tasks.count <= 1 {
@@ -1332,6 +1493,35 @@ unsafe fn map_user_page(address_space: &mut AddressSpace, virt_addr: usize, phys
             phys_addr, ATTR_NORMAL, 0b01, 0b11, !executable
         );
 }
+
+unsafe fn map_run_page(
+    address_space: &mut AddressSpace,
+    virt_addr: usize,
+    phys_addr: usize,
+    writable: bool,
+    executable: bool,
+) {
+    assert!(virt_addr % PAGE_SIZE == 0);
+    assert!(phys_addr % PAGE_SIZE == 0);
+    assert!(virt_addr >= VMAP_START);
+    assert!(virt_addr < VMAP_END);
+
+    let index = (virt_addr >> 12) & 0x1FF;
+    assert!(!address_space.l3_vmap.entries[index].is_valid());
+
+    // AP=01: EL0 read/write.
+    // AP=11: EL0 read-only.
+    let ap = if writable { 0b01 } else { 0b11 };
+
+    address_space.l3_vmap.entries[index] =
+        PageTableEntry::new_page(
+            phys_addr,
+            ATTR_NORMAL,
+            ap,
+            0b11,
+            !executable,
+        );
+}
 unsafe fn map_user_stack(address_space: &mut AddressSpace) -> usize {
     let stack_bottom = USER_STACK_TOP as usize - USER_STACK_SIZE as usize;
 
@@ -1697,27 +1887,16 @@ fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
     }
 
     if mapped != pages {
-        // Roll back the pages we successfully mapped.
-        //
-        // These heap virtual addresses are managed by USER_HEAP_NEXT,
-        // not by the global VMAP_BITMAP, so do not call
-        // free_virtual_page() here.
         unsafe {
             let address_space = &mut ADDRESS_SPACES[address_space_id];
 
             for i in 0..mapped {
                 let virtual_address = start + i * PAGE_SIZE;
                 let index = (virtual_address >> 12) & 0x1FF;
-
                 let entry = address_space.l3_vmap.entries[index].0;
-                let physical =
-                    ((entry >> 12) << 12) as usize;
+                let physical = ((entry >> 12) << 12) as usize;
 
-                unmap_page(
-                    address_space,
-                    virtual_address,
-                );
-
+                unmap_page(address_space, virtual_address);
                 free_page(physical);
             }
 
@@ -1729,9 +1908,6 @@ fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
 
     unsafe {
         USER_HEAP_NEXT[address_space_id] = end;
-
-        // Ensure the new page-table entries are visible before
-        // returning to EL0.
         core::arch::asm!("dsb sy", "isb");
     }
 
@@ -1849,10 +2025,13 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 }
                 frame.x[0] = len as u64;
                 return;
-            }
+            },
             4 => {
                 let pages = frame.x[0] as usize;
-                let address_space_id = unsafe { CURRENT_ASID };
+
+                let address_space_id = unsafe {
+                    CURRENT_ASID
+                };
 
                 frame.x[0] = match alloc_user_pages(
                     address_space_id,
@@ -2035,7 +2214,7 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
             //scheduler.add_user_task(user_test);
-            scheduler.add_user_task(USER_CODE_BASE as u64);
+            scheduler.add_user_task();
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();

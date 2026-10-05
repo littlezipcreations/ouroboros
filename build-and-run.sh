@@ -1,32 +1,31 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "=== Building userspace ==="
-
-cd user-init
-
-rustc \
-    --target aarch64-unknown-none \
-    -C opt-level=2 \
-    -C panic=abort \
-    -C relocation-model=static \
-    -C link-arg=-Tlinker.ld \
-    -o user-init.elf \
-    src/main.rs
-
-objcopy \
-    -O binary \
-    user-init.elf \
-    user-init.bin
-
-cd ..
+echo "=== Building userspace ELF ==="
+(
+    cd user-init
+    cargo build --release
+    python3 ../ouro-pack.py \
+        target/aarch64-unknown-none/release/user-init \
+        user-init.run
+)
 
 echo "=== Building kernel ==="
-
 cargo build --release
 
-echo "=== Running Ouroboros ==="
+echo "=== Build complete ==="
+echo "Generated user-init.run and rebuilt the kernel."
 
-qemu-system-aarch64   -machine virt,gic-version=2   -cpu cortex-a76   -m 512M   -nographic  -kernel target/aarch64-unknown-none/release/ouroboros -d int -D qemu.log
+if command -v qemu-system-aarch64 >/dev/null 2>&1; then
+    echo "=== Launching QEMU ==="
+    qemu-system-aarch64 \
+        -M virt \
+        -cpu cortex-a53 \
+        -m 512 \
+        -nographic \
+        -kernel target/aarch64-unknown-none/release/ouroboros
+else
+    echo "qemu-system-aarch64 not found; skipping execution."
+fi
