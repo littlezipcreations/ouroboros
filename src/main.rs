@@ -142,6 +142,9 @@ static mut TASK_STACKS: [TaskStack; MAX_TASKS] =
 const USER_STACK_TOP: u64 = 0x0000_0000_8020_0000;
 const USER_STACK_SIZE: usize = 16 * 1024;
 const USER_CODE_BASE: usize = 0x8000_0000;
+const USER_HEAP_START: usize = 0x8001_0000;
+const USER_HEAP_END: usize = USER_STACK_TOP as usize - USER_STACK_SIZE;
+static mut USER_HEAP_NEXT: [usize; MAX_TASKS] = [USER_HEAP_START; MAX_TASKS];
 static USER_INIT: &[u8] = include_bytes!("../user-init/user-init.bin");
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
@@ -183,24 +186,33 @@ impl Task {
         unsafe{
             ADDRESS_SPACES[id].init();
         }
-        assert!(USER_INIT.len() <= PAGE_SIZE);
-
-        let physical = alloc_page()
-            .expect("Failed to allocate page for user code");
-
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                USER_INIT.as_ptr(),
-                physical as *mut u8,
-                USER_INIT.len(),
-            );
+            USER_HEAP_NEXT[id] = USER_HEAP_START;
+        }
+        let code_pages = (USER_INIT.len() + PAGE_SIZE - 1) / PAGE_SIZE;
 
-            map_user_page(
-                &mut ADDRESS_SPACES[id],
-                USER_CODE_BASE,
-                physical,
-                true,
-            );
+        for i in 0..code_pages {
+            let physical = alloc_page()
+                .expect("Failed to allocate page for user code");
+
+            let offset = i * PAGE_SIZE;
+            let remaining = USER_INIT.len() - offset;
+            let copy_len = remaining.min(PAGE_SIZE);
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    USER_INIT.as_ptr().add(offset),
+                    physical as *mut u8,
+                    copy_len,
+                );
+
+                map_user_page(
+                    &mut ADDRESS_SPACES[id],
+                    USER_CODE_BASE + offset,
+                    physical,
+                    true,
+                );
+            }
         }
         let stack_top = USER_STACK_TOP;
         for i in 0..(USER_STACK_SIZE / PAGE_SIZE){
@@ -1734,6 +1746,30 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 }
                 panic!("SVC #2 with no scheduler");
             },
+            3 => {
+                let ptr = frame.x[0] as usize;
+                let len = frame.x[1] as usize;
+                let end = match ptr.checked_add(len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = (-1i64) as u64;
+                        return;
+                    }
+                };
+                if ptr < VMAP_START || end > VMAP_END {
+                    frame.x[0] = (-1i64) as u64;
+                    return;
+                }
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(ptr as *const u8, len)
+                };
+                for &byte in bytes {
+                    let mut uart = Uart::new(0x0900_0000);
+                    uart.put_byte(byte);
+                }
+                frame.x[0] = len as u64;
+                return;
+            }
             42 => {
                 writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
                 return;
