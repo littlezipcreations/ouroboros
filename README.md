@@ -1,0 +1,1 @@
+To use - a file named ouroboros.img must be made (512MiB) in the ouroboros directory. The OS fails to boot otherwise
