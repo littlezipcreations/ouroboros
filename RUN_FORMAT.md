@@ -33,4 +33,4 @@ The loader allocates enough pages for `memory_size`, clears them to zero, copies
 `file_size` bytes, and maps them with the requested read/write/execute permissions.
 
 For v1, segments must start on 4 KiB boundaries and live inside Ouroboros' user VM
-range. Up to 16 loadable segments are supported.
+range. Up to 16 loadable segments are supported. (making it support up to 64KiB of data, or a 66.3KiB file in total).

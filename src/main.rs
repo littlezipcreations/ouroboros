@@ -3,6 +3,8 @@
 #![allow(warnings)]
 mod exception;
 use exception::ExceptionFrame;
+mod virtio;
+use virtio::VirtioBlk;
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
 use core::fmt::{self, Write};
@@ -106,8 +108,9 @@ impl AddressSpace {
         self.l1.entries[0] = PageTableEntry::new_table(&raw const self.l2_device);
         self.l1.entries[1] = PageTableEntry::new_table(&raw const self.l2_ram);
         self.l1.entries[2] = PageTableEntry::new_table(&raw const self.l2_vmap);
-        self.l2_device.entries[64] = PageTableEntry::new_block(0x0800_0000, ATTR_DEVICE, 0b00, 0b10, true,);
+        self.l2_device.entries[64] = PageTableEntry::new_block(0x0800_0000, ATTR_DEVICE, 0b00, 0b10, true);
         self.l2_device.entries[72] = PageTableEntry::new_block(0x0900_0000, ATTR_DEVICE, 0b00, 0b10, true);
+        self.l2_device.entries[80] = PageTableEntry::new_block(0x0A00_0000, ATTR_DEVICE, 0b00, 0b10, true); 
         self.l2_ram.entries[0] = PageTableEntry::new_table(&raw const self.l3_ram);
         for i in 1..256{
             self.l2_ram.entries[i] = PageTableEntry::new_block(0x4000_0000 + i * 0x20_0000, ATTR_NORMAL, 0b00, 0b11, false);
@@ -1493,7 +1496,6 @@ unsafe fn map_user_page(address_space: &mut AddressSpace, virt_addr: usize, phys
             phys_addr, ATTR_NORMAL, 0b01, 0b11, !executable
         );
 }
-
 unsafe fn map_run_page(
     address_space: &mut AddressSpace,
     virt_addr: usize,
@@ -1742,6 +1744,14 @@ unsafe fn set_page_table() {
     PAGE_TABLE_L2_DEVICE.entries[72] =
         PageTableEntry::new_block(0x09000000, ATTR_DEVICE, 0b00, 0b10, true,);
 
+    PAGE_TABLE_L2_DEVICE.entries[80] =
+    PageTableEntry::new_block(
+        0x0A000000,
+        ATTR_DEVICE,
+        0b00,
+        0b10,
+        true,
+    );
     // ========================================================
     // L2: RAM
     // ========================================================
@@ -2204,6 +2214,75 @@ pub extern "C" fn rust_start() -> ! {
     enable_mmu();
 
     writeln!(uart, "MMU enabled!").unwrap();
+    writeln!(uart, "Initialising virtio block device...").unwrap();
+
+    let disk = VirtioBlk::new();
+    let (magic, version, device_id) = disk.probe();
+
+    writeln!(
+        uart,
+        "Virtio: magic={:#x} version={} device={}",
+        magic,
+        version,
+        device_id
+    ).unwrap();
+    match disk.init(){
+        Ok(()) => {
+            writeln!(uart, "Virtio block device initialised!").unwrap();
+            let sectors = disk.capacity_sectors();
+            let blocks = disk.capacity_blocks();
+            writeln!(uart, "Disk sectors: {}", sectors).unwrap();
+            writeln!(uart, "4 KiB blocks: {}", blocks).unwrap();
+
+            let test_block = blocks -1;
+
+            let mut write_buffer = [0u8; 4096];
+            let mut read_buffer = [0u8; 4096];
+            write_buffer[0..8].copy_from_slice(b"OUROTEST");
+
+            match disk.write_block(test_block, &write_buffer){
+                Ok(()) => {
+                    writeln!(uart, "Block write: PASS").unwrap();
+                }
+                Err(error) => {
+                    writeln!(uart, "Block write: FAIL {:?}", error).unwrap();
+                    loop{unsafe{core::arch::asm!("wfe");}}
+                }
+
+            }
+            match disk.read_block(test_block, &mut read_buffer) {
+                Ok(()) => {
+                    if &read_buffer[0..8] == b"OUROTEST" {
+                        writeln!(uart, "Block read: PASS").unwrap();
+                    } else {
+                        writeln!(uart, "Block read: FAIL (bad data)").unwrap();
+
+                        loop {
+                            unsafe {
+                                core::arch::asm!("wfe");
+                            }
+                        }
+                    }
+                }
+
+                Err(error) => {
+                    writeln!(uart, "Block read: FAIL {:?}", error).unwrap();
+
+                    loop {
+                        unsafe {
+                            core::arch::asm!("wfe");
+                        }
+                    }
+                }
+            }
+
+            writeln!(uart, "Virtio block test complete!").unwrap();
+        }
+        Err(error) => {
+            writeln!(uart, "Virtio init failed: {:?}", error).unwrap();
+            loop{unsafe{core::arch::asm!("wfe");}}
+        }
+    }
     writeln!(uart, "Initialising scheduler...").unwrap();
     unsafe {
         let scheduler = &raw mut SCHEDULER;

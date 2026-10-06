@@ -25,7 +25,10 @@ if command -v qemu-system-aarch64 >/dev/null 2>&1; then
         -cpu cortex-a53 \
         -m 512 \
         -nographic \
-        -kernel target/aarch64-unknown-none/release/ouroboros
+        -kernel target/aarch64-unknown-none/release/ouroboros \
+        -global virtio-mmio.force-legacy=false \
+        -drive if=none,file=ouroboros.img,format=raw,id=ouroDisk \
+        -device virtio-blk-device,drive=ouroDisk 
 else
     echo "qemu-system-aarch64 not found; skipping execution."
 fi

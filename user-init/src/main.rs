@@ -55,51 +55,14 @@ pub extern "C" fn _start() -> ! {
 
     writeln!(
         &mut stdout,
-        "Formatting: {} {:#x}",
-        42,
-        0xdead_beef_u64
-    ).unwrap();
-
-    let message = String::from("String allocation works");
-
-    writeln!(
-        &mut stdout,
-        "String: {}",
-        message
-    ).unwrap();
-
-    let boxed = Box::new(123456789_u64);
-
-    writeln!(
-        &mut stdout,
-        "Box: {}",
-        boxed
-    ).unwrap();
-
-    let mut numbers = Vec::new();
-
-    for i in 0..1000_u64 {
-        numbers.push(i);
+        "I just wanna see if I can execute arbitrary code in ouroboros").unwrap();
+    for i in 0..10{
+        writeln!(
+            &mut stdout,
+            "Counting: {}",
+            i
+        ).unwrap();
     }
-
-    writeln!(
-        &mut stdout,
-        "Vec length: {}",
-        numbers.len()
-    ).unwrap();
-
-    writeln!(
-        &mut stdout,
-        "Vec[0] = {}",
-        numbers[0]
-    ).unwrap();
-
-    writeln!(
-        &mut stdout,
-        "Vec[999] = {}",
-        numbers[999]
-    ).unwrap();
-
     writeln!(
         &mut stdout,
         "================================"
