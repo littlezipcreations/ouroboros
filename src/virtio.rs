@@ -239,6 +239,7 @@ impl VirtioBlk {
         }
     }
     pub fn read_block(&self, block:u64, output: &mut[u8; 4096]) -> Result<(), VirtioError>{
+        self.submit(false, block)?;
         unsafe {
             core::ptr::copy_nonoverlapping(
                 core::ptr::addr_of!(BUFFER.bytes) as *const u8,

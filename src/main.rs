@@ -5,6 +5,7 @@ mod exception;
 use exception::ExceptionFrame;
 mod virtio;
 use virtio::VirtioBlk;
+mod filesystem;
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
 use core::fmt::{self, Write};
@@ -2283,7 +2284,99 @@ pub extern "C" fn rust_start() -> ! {
             loop{unsafe{core::arch::asm!("wfe");}}
         }
     }
-    writeln!(uart, "Initialising scheduler...").unwrap();
+    writeln!(uart, "Initialising OuroFS...").unwrap();
+
+    let mut filesystem = filesystem::FileSystem::new(disk);
+
+    match filesystem.mount() {
+        Ok(superblock) => {
+            writeln!(uart, "OuroFS mounted!").unwrap();
+            writeln!(uart, "Filesystem blocks: {}", superblock.total_blocks).unwrap();
+            writeln!(uart, "Block size: {}", superblock.block_size).unwrap();
+            writeln!(uart, "Inodes: {}", superblock.inode_count).unwrap();
+        }
+
+        Err(()) => {
+            writeln!(uart, "No valid OuroFS found. Formatting...").unwrap();
+
+            match filesystem.format() {
+                Ok(()) => {
+                    writeln!(uart, "OuroFS formatted!").unwrap();
+
+                    match filesystem.mount() {
+                        Ok(superblock) => {
+                            writeln!(uart, "OuroFS mounted after formatting!").unwrap();
+                            writeln!(uart, "Filesystem blocks: {}", superblock.total_blocks).unwrap();
+                            writeln!(uart, "Block size: {}", superblock.block_size).unwrap();
+                            writeln!(uart, "Inodes: {}", superblock.inode_count).unwrap();
+                        }
+
+                        Err(()) => {
+                            writeln!(uart, "ERROR: Could not mount newly formatted OuroFS!").unwrap();
+                            loop{unsafe{core::arch::asm!("wfe");}}
+                        }
+                    }
+                }
+
+                Err(()) => {
+                    writeln!(uart, "ERROR: OuroFS formatting failed!").unwrap();
+                    loop{unsafe{core::arch::asm!("wfe");}}
+                }
+            }
+        }
+    }
+    writeln!(uart, "================================").unwrap();
+    writeln!(uart, "      OUROFS FILESYSTEM TEST     ").unwrap();
+    writeln!(uart, "================================").unwrap();
+
+    // Create a file
+    let fileInode = filesystem
+        .createFile(b"Hello from OuroFS!")
+        .unwrap();
+
+    writeln!(uart, "Created file at inode {}", fileInode).unwrap();
+    writeln!(uart, "PASS: createFile").unwrap();
+
+    // Read it back
+    let mut buffer = [0u8; 64];
+
+    let size = filesystem
+        .readFile(fileInode, &mut buffer)
+        .unwrap();
+
+    assert_eq!(
+        &buffer[..size],
+        b"Hello from OuroFS!"
+    );
+
+    writeln!(uart, "PASS: readFile").unwrap();
+
+    // Create a directory under the root.
+    // This assumes inode 0 is already initialised as a directory.
+  //  let directoryInode = filesystem
+   //     .createDirectory(0, b"test")
+    //    .unwrap();
+
+   // writeln!(
+   //     uart,
+     //   "Created directory at inode {}",
+   //     directoryInode
+   // ).unwrap();
+
+   // writeln!(uart, "PASS: createDirectory").unwrap();
+
+    // Find the directory by name
+   // let found = filesystem
+   //     .findDirectoryEntry(0, b"test")
+   //     .unwrap();
+
+   // assert_eq!(found, Some(directoryInode));
+
+    //writeln!(uart, "PASS: findDirectoryEntry").unwrap();
+
+    writeln!(uart, "================================").unwrap();
+    writeln!(uart, "       OUROFS TEST PASS        ").unwrap();
+    writeln!(uart, "================================").unwrap();
     unsafe {
         let scheduler = &raw mut SCHEDULER;
         (*scheduler) = Some(Scheduler::new());
