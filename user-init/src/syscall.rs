@@ -1,3 +1,4 @@
+#![warn(dead_code)]
 use core::arch::asm;
 
 #[inline(always)]
@@ -57,4 +58,12 @@ pub fn alloc_pages(pages: usize) -> Option<*mut u8> {
     } else {
         Some(address as *mut u8)
     }
+}
+
+pub fn read_byte() -> Option<u8>{
+    let result: u64;
+    unsafe {
+        asm!("svc #5", lateout("x0") result,);
+    }
+    if result == u64::MAX{None} else{Some(result as u8)}
 }

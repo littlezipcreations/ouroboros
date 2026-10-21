@@ -38,6 +38,17 @@ impl Uart {
             self.put_byte(byte);
         }
     }
+    fn try_get_byte(&self) -> Option<u8>{
+        unsafe{
+            let base = self.base as *mut u32;
+            let flags = base.add(0x18 / 4).read_volatile();
+            if flags & (1 << 4) != 0{
+                None
+            } else {
+                Some(base.read_volatile() as u8)
+            }
+        }
+    }
 }
 impl Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -151,6 +162,12 @@ const USER_HEAP_END: usize = USER_STACK_TOP as usize - USER_STACK_SIZE;
 static mut USER_HEAP_NEXT: [usize; MAX_TASKS] = [USER_HEAP_START; MAX_TASKS];
 static USER_RUN: &[u8] = include_bytes!("../user-init/user-init.run");
 
+// OuroFS currently supports files using 12 direct data blocks.
+const MAX_RUN_SIZE: usize = 12 * 4096;
+
+// Static storage keeps the executable buffer off the kernel stack.
+static mut RUN_LOAD_BUFFER: [u8; MAX_RUN_SIZE] = [0; MAX_RUN_SIZE];
+
 // ============================================================
 // Ouroboros .run executable format
 // ============================================================
@@ -198,9 +215,7 @@ fn run_align_up(value: usize) -> usize {
     (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
-fn load_run(address_space_id: usize) -> (u64, usize) {
-    let data = USER_RUN;
-
+fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
     assert!(data.len() >= RUN_HEADER_SIZE, ".run header too small");
     assert!(&data[0..4] == RUN_MAGIC, "invalid .run magic");
 
@@ -357,13 +372,13 @@ impl Task {
 
         task
     }
-    fn new_user(id: usize) -> Self {
+    fn new_user(id: usize, run_data: &[u8]) -> Self {
         unsafe {
             ADDRESS_SPACES[id].init();
             USER_HEAP_NEXT[id] = USER_HEAP_START;
         }
 
-        let (entry, heap_start) = load_run(id);
+        let (entry, heap_start) = load_run(id, run_data);
 
         unsafe {
             USER_HEAP_NEXT[id] = heap_start;
@@ -438,13 +453,13 @@ impl TaskTable {
         self.count += 1;
         id
     }
-    fn create_user(&mut self) -> usize {
+    fn create_user(&mut self, runData: &[u8]) -> usize {
         if self.count >= MAX_TASKS {
             panic!("No free task slots");
         }
 
         let id = self.count;
-        self.tasks[id] = Some(Task::new_user(id));
+        self.tasks[id] = Some(Task::new_user(id, runData));
         self.count += 1;
         id
     }
@@ -1108,8 +1123,8 @@ impl Scheduler {
     fn add_task(&mut self, entry: fn()) -> usize {
         self.tasks.create(entry)
     }
-    fn add_user_task(&mut self) -> usize {
-        self.tasks.create_user()
+    fn add_user_task(&mut self, runData: &[u8]) -> usize {
+        self.tasks.create_user(runData)
     }
     fn next_ready(&self) -> Option<usize> {
         if self.tasks.count <= 1 {
@@ -1257,6 +1272,8 @@ impl Scheduler {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".scheduler")]
 static mut SCHEDULER: Option<Scheduler> = None;
+static mut FILESYSTEM_PTR: *mut filesystem::FileSystem =
+    core::ptr::null_mut();
 // ============================================================
 // GIC
 // ============================================================
@@ -2054,6 +2071,61 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
 
                 return;
             }
+            5 => {
+                frame.x[0] = match uart.try_get_byte(){
+                    Some(byte) => byte as u64,
+                    None => u64::MAX,
+                };
+                return;
+            }
+            10 =>{
+                let ptr = frame.x[0] as usize;
+                let len = frame.x[1] as usize;
+                if len == 0 || len > 512{
+                    frame.x[0] = (-1i64) as u64;
+                    return;
+                }
+                let end = match ptr.checked_add(len){
+                    Some(end) => end,
+                    None =>{
+                        frame.x[0] = (-1i64) as u64;
+                        return;
+                    }
+                };
+                if ptr < VMAP_START || end > VMAP_END{
+                    frame.x[0] = (-1i64) as u64;
+                    return;
+                }
+                let mut path = [0u8; 512];
+                unsafe{
+                    core::ptr::copy_nonoverlapping(ptr as *const u8, path.as_mut_ptr(), len);
+                }
+                let scheduler_ptr = &raw mut SCHEDULER;
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.statPath(&path[..len]) {
+                            Ok(stat) => {
+                                frame.x[0] = stat.inode as u64;
+                                frame.x[1] = stat.size;
+                                frame.x[2] = match stat.kind {
+                                    filesystem::FileKind::File => 1,
+                                    filesystem::FileKind::Directory => 2,
+                                };
+                                frame.x[3] = stat.links as u64;
+                            }
+                            Err(()) => {
+                                frame.x[0] = (-1i64) as u64;
+                            }
+                        }
+                    } else {
+                        frame.x[0] = (-1i64) as u64;
+                    }
+                }
+
+                return;
+            },
+            
             42 => {
                 writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
                 return;
@@ -2287,7 +2359,9 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Initialising OuroFS...").unwrap();
 
     let mut filesystem = filesystem::FileSystem::new(disk);
-
+    unsafe {
+        FILESYSTEM_PTR = &mut filesystem;
+    }
     match filesystem.mount() {
         Ok(superblock) => {
             writeln!(uart, "OuroFS mounted!").unwrap();
@@ -2325,58 +2399,479 @@ pub extern "C" fn rust_start() -> ! {
             }
         }
     }
+        // ============================================================
+    // OUROFS PATH AND FILESYSTEM TESTS
+    // ============================================================
+
     writeln!(uart, "================================").unwrap();
-    writeln!(uart, "      OUROFS FILESYSTEM TEST     ").unwrap();
+    writeln!(uart, "       OUROFS PATH TEST         ").unwrap();
     writeln!(uart, "================================").unwrap();
 
-    // Create a file
-    let fileInode = filesystem
-        .createFile(b"Hello from OuroFS!")
+    // ------------------------------------------------------------
+    // 1. Directory creation and duplicate rejection
+    // ------------------------------------------------------------
+
+    let directoryInode = filesystem
+        .createDirectoryPath(b"/ourofs-test")
         .unwrap();
 
-    writeln!(uart, "Created file at inode {}", fileInode).unwrap();
-    writeln!(uart, "PASS: createFile").unwrap();
+    writeln!(uart, "PASS: createDirectoryPath").unwrap();
 
-    // Read it back
+    assert!(
+        filesystem
+            .createDirectoryPath(b"/ourofs-test")
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: duplicate directory rejected").unwrap();
+
+    // ------------------------------------------------------------
+    // 2. Nested file creation
+    // ------------------------------------------------------------
+
+    let fileInode = filesystem
+        .createFileInDirectory(
+            directoryInode,
+            b"hello.txt",
+            b"Hello from OuroFS!",
+        )
+        .unwrap();
+
+    writeln!(uart, "PASS: nested file creation").unwrap();
+
+    // ------------------------------------------------------------
+    // 3. Path resolution
+    // ------------------------------------------------------------
+
+    let resolved = filesystem
+        .resolvePath(b"/ourofs-test/hello.txt")
+        .unwrap();
+
+    assert_eq!(resolved, fileInode);
+
+    assert_eq!(
+        filesystem
+            .resolvePath(b"/ourofs-test/../ourofs-test/hello.txt")
+            .unwrap(),
+        fileInode,
+    );
+
+    assert!(filesystem.resolvePath(b"relative/path").is_err());
+
+    writeln!(uart, "PASS: resolvePath").unwrap();
+
+    // ------------------------------------------------------------
+    // 4. Read file by inode and by path
+    // ------------------------------------------------------------
+
     let mut buffer = [0u8; 64];
 
     let size = filesystem
-        .readFile(fileInode, &mut buffer)
+        .readFile(resolved, &mut buffer)
         .unwrap();
 
-    assert_eq!(
-        &buffer[..size],
-        b"Hello from OuroFS!"
-    );
+    assert_eq!(&buffer[..size], b"Hello from OuroFS!");
 
     writeln!(uart, "PASS: readFile").unwrap();
 
-    // Create a directory under the root.
-    // This assumes inode 0 is already initialised as a directory.
-  //  let directoryInode = filesystem
-   //     .createDirectory(0, b"test")
-    //    .unwrap();
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/hello.txt", &mut buffer)
+        .unwrap();
 
-   // writeln!(
-   //     uart,
-     //   "Created directory at inode {}",
-   //     directoryInode
-   // ).unwrap();
+    assert_eq!(&buffer[..size], b"Hello from OuroFS!");
 
-   // writeln!(uart, "PASS: createDirectory").unwrap();
+    writeln!(uart, "PASS: readFilePath").unwrap();
 
-    // Find the directory by name
-   // let found = filesystem
-   //     .findDirectoryEntry(0, b"test")
-   //     .unwrap();
+    let mut smallBuffer = [0u8; 4];
 
-   // assert_eq!(found, Some(directoryInode));
+    assert!(
+        filesystem
+            .readFilePath(
+                b"/ourofs-test/hello.txt",
+                &mut smallBuffer,
+            )
+            .is_err()
+    );
 
-    //writeln!(uart, "PASS: findDirectoryEntry").unwrap();
+    writeln!(uart, "PASS: undersized read buffer rejected").unwrap();
+
+    assert!(
+        filesystem
+            .readFilePath(b"/ourofs-test", &mut buffer)
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: directory cannot be read as a file").unwrap();
+
+    // ------------------------------------------------------------
+    // 5. Directory enumeration
+    // ------------------------------------------------------------
+
+    let mut foundHello = false;
+
+    let entryCount = filesystem
+        .listDirectory(directoryInode, |name, inode, _kind| {
+            if name == b"hello.txt" && inode == fileInode {
+                foundHello = true;
+            }
+        })
+        .unwrap();
+
+    assert_eq!(entryCount, 3);
+    assert!(foundHello);
+
+    // The three entries are ".", ".." and "hello.txt".
+    writeln!(uart, "PASS: listDirectory").unwrap();
+
+    // ------------------------------------------------------------
+    // 6. File metadata
+    // ------------------------------------------------------------
+
+    let fileInfo = filesystem
+        .statPath(b"/ourofs-test/hello.txt")
+        .unwrap();
+
+    assert_eq!(fileInfo.inode, fileInode);
+    assert_eq!(fileInfo.kind, filesystem::FileKind::File);
+    assert_eq!(fileInfo.size, b"Hello from OuroFS!".len() as u64);
+    assert_eq!(fileInfo.links, 1);
+
+    writeln!(uart, "PASS: file statPath").unwrap();
+
+    let directoryInfo = filesystem
+        .statPath(b"/ourofs-test")
+        .unwrap();
+
+    assert_eq!(directoryInfo.inode, directoryInode);
+    assert_eq!(directoryInfo.kind, filesystem::FileKind::Directory);
+
+    writeln!(uart, "PASS: directory statPath").unwrap();
+
+    // ------------------------------------------------------------
+    // 7. Create a file using an absolute path
+    // ------------------------------------------------------------
+
+    let notesInode = filesystem
+        .createFilePath(
+            b"/ourofs-test/notes.txt",
+            b"Created through a path!",
+        )
+        .unwrap();
+
+    assert_eq!(
+        filesystem
+            .resolvePath(b"/ourofs-test/notes.txt")
+            .unwrap(),
+        notesInode,
+    );
+
+    writeln!(uart, "PASS: createFilePath").unwrap();
+
+    assert!(
+        filesystem
+            .createFilePath(
+                b"/ourofs-test/notes.txt",
+                b"Duplicate!",
+            )
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: duplicate file rejected").unwrap();
+
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/notes.txt", &mut buffer)
+        .unwrap();
+
+    assert_eq!(&buffer[..size], b"Created through a path!");
+
+    writeln!(uart, "PASS: path-created file readable").unwrap();
+
+    // ------------------------------------------------------------
+    // 8. Replace existing file contents
+    // ------------------------------------------------------------
+
+    let replacement = b"Replacement works!";
+
+    let written = filesystem
+        .writeFilePath(
+            b"/ourofs-test/hello.txt",
+            replacement,
+        )
+        .unwrap();
+
+    assert_eq!(written, replacement.len());
+
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/hello.txt", &mut buffer)
+        .unwrap();
+
+    assert_eq!(&buffer[..size], replacement);
+
+    assert_eq!(
+        filesystem
+            .statPath(b"/ourofs-test/hello.txt")
+            .unwrap()
+            .size,
+        replacement.len() as u64,
+    );
+
+    writeln!(uart, "PASS: file replacement").unwrap();
+
+    // ------------------------------------------------------------
+    // 9. Truncate and rewrite a file
+    // ------------------------------------------------------------
+
+    filesystem
+        .writeFilePath(b"/ourofs-test/hello.txt", b"")
+        .unwrap();
+
+    assert_eq!(
+        filesystem
+            .statPath(b"/ourofs-test/hello.txt")
+            .unwrap()
+            .size,
+        0,
+    );
+
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/hello.txt", &mut buffer)
+        .unwrap();
+
+    assert_eq!(size, 0);
+
+    writeln!(uart, "PASS: file truncation").unwrap();
+
+    let rewritten = b"Recreated after truncation!";
+
+    filesystem
+        .writeFilePath(b"/ourofs-test/hello.txt", rewritten)
+        .unwrap();
+
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/hello.txt", &mut buffer)
+        .unwrap();
+
+    assert_eq!(&buffer[..size], rewritten);
+
+    writeln!(uart, "PASS: writing after truncation").unwrap();
+
+    // ------------------------------------------------------------
+    // 10. Empty-file creation and reading
+    // ------------------------------------------------------------
+
+    filesystem
+        .createFilePath(b"/ourofs-test/zero.bin", b"")
+        .unwrap();
+
+    let zeroInfo = filesystem
+        .statPath(b"/ourofs-test/zero.bin")
+        .unwrap();
+
+    assert_eq!(zeroInfo.kind, filesystem::FileKind::File);
+    assert_eq!(zeroInfo.size, 0);
+
+    let size = filesystem
+        .readFilePath(b"/ourofs-test/zero.bin", &mut buffer)
+        .unwrap();
+
+    assert_eq!(size, 0);
+
+    writeln!(uart, "PASS: empty-file handling").unwrap();
+
+    // ------------------------------------------------------------
+    // 11. Nested directory creation
+    // ------------------------------------------------------------
+
+    let subdirectoryInode = filesystem
+        .createDirectoryPath(b"/ourofs-test/subdir")
+        .unwrap();
+
+    assert_eq!(
+        filesystem
+            .resolvePath(b"/ourofs-test/subdir")
+            .unwrap(),
+        subdirectoryInode,
+    );
+
+    writeln!(uart, "PASS: nested directory creation").unwrap();
+
+    assert!(
+        filesystem
+            .createDirectoryPath(b"/ourofs-test/subdir")
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: nested duplicate rejected").unwrap();
+
+    // ------------------------------------------------------------
+    // 12. Non-empty directory protection
+    // ------------------------------------------------------------
+
+    filesystem
+        .createFilePath(
+            b"/ourofs-test/subdir/child.txt",
+            b"Child file",
+        )
+        .unwrap();
+
+    assert!(
+        filesystem
+            .removeDirectoryPath(b"/ourofs-test/subdir")
+            .is_err()
+    );
+
+    assert!(
+        filesystem
+            .resolvePath(b"/ourofs-test/subdir/child.txt")
+            .is_ok()
+    );
+
+    writeln!(uart, "PASS: non-empty directory protected").unwrap();
+
+    // ------------------------------------------------------------
+    // 13. Delete the child, then remove its directory
+    // ------------------------------------------------------------
+
+    filesystem
+        .deleteFilePath(b"/ourofs-test/subdir/child.txt")
+        .unwrap();
+
+    assert!(
+        filesystem
+            .resolvePath(b"/ourofs-test/subdir/child.txt")
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: nested file deletion").unwrap();
+
+    filesystem
+        .removeDirectoryPath(b"/ourofs-test/subdir")
+        .unwrap();
+
+    assert!(
+        filesystem
+            .resolvePath(b"/ourofs-test/subdir")
+            .is_err()
+    );
+
+    writeln!(uart, "PASS: empty directory removal").unwrap();
+
+    // ------------------------------------------------------------
+    // 14. Protect the root directory
+    // ------------------------------------------------------------
+
+    assert!(filesystem.removeDirectoryPath(b"/").is_err());
+
+    assert_eq!(filesystem.resolvePath(b"/").unwrap(), 0);
+
+    writeln!(uart, "PASS: root directory protected").unwrap();
+
+    // ------------------------------------------------------------
+    // 15. File deletion and parent preservation
+    // ------------------------------------------------------------
+
+    filesystem
+        .deleteFilePath(b"/ourofs-test/hello.txt")
+        .unwrap();
+
+    assert!(
+        filesystem
+            .resolvePath(b"/ourofs-test/hello.txt")
+            .is_err()
+    );
+
+    assert_eq!(
+        filesystem.resolvePath(b"/ourofs-test").unwrap(),
+        directoryInode,
+    );
+
+    writeln!(uart, "PASS: deleteFilePath").unwrap();
+    writeln!(uart, "PASS: deleted file cannot be resolved").unwrap();
+    writeln!(uart, "PASS: parent directory preserved").unwrap();
+
+    filesystem
+        .deleteFilePath(b"/ourofs-test/notes.txt")
+        .unwrap();
+
+    filesystem
+        .deleteFilePath(b"/ourofs-test/zero.bin")
+        .unwrap();
+
+    writeln!(uart, "PASS: remaining test files deleted").unwrap();
+
+    // Only "." and ".." should remain in the test directory.
+    let entryCount = filesystem
+        .listDirectory(directoryInode, |_name, _inode, _kind| {})
+        .unwrap();
+
+    assert_eq!(entryCount, 2);
+
+    writeln!(uart, "PASS: test directory is empty").unwrap();
+
+    // ------------------------------------------------------------
+    // 16. Remove the test directory and verify cleanup
+    // ------------------------------------------------------------
+
+    filesystem
+        .removeDirectoryPath(b"/ourofs-test")
+        .unwrap();
+
+    assert!(
+        filesystem
+            .resolvePath(b"/ourofs-test")
+            .is_err()
+    );
+
+    assert_eq!(filesystem.resolvePath(b"/").unwrap(), 0);
+
+    writeln!(uart, "PASS: test directory cleanup").unwrap();
 
     writeln!(uart, "================================").unwrap();
-    writeln!(uart, "       OUROFS TEST PASS        ").unwrap();
+    writeln!(uart, "        OUROFS PATH PASS        ").unwrap();
     writeln!(uart, "================================").unwrap();
+
+    // Install the embedded user program into OuroFS the first time it is
+    // needed. Once installed, the scheduler loads the copy stored on disk.
+    if filesystem.resolvePath(b"/bin").is_err() {
+        filesystem
+            .createDirectoryPath(b"/bin")
+            .expect("Failed to create /bin in OuroFS");
+    }
+
+    if filesystem.resolvePath(b"/bin/user-init.run").is_err() {
+        assert!(
+            USER_RUN.len() <= MAX_RUN_SIZE,
+            "Embedded user-init.run exceeds OuroFS's current 48 KiB file limit"
+        );
+
+        filesystem
+            .createFilePath(b"/bin/user-init.run", USER_RUN)
+            .expect("Failed to install user-init.run into OuroFS");
+
+        writeln!(uart, "Installed /bin/user-init.run into OuroFS.").unwrap();
+    }
+
+    // Read the executable from the filesystem into static storage. Do not
+    // use a large local array here: the kernel stack is only 16 KiB.
+    let runSize = unsafe {
+        let buffer = &raw mut RUN_LOAD_BUFFER;
+
+        filesystem
+            .readFilePath(b"/bin/user-init.run", &mut *buffer)
+            .expect("Failed to read /bin/user-init.run from OuroFS")
+    };
+
+    assert!(runSize <= MAX_RUN_SIZE, "user-init.run exceeds load buffer");
+
+    let runData: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(RUN_LOAD_BUFFER).cast::<u8>(),
+            runSize,
+        )
+    };
+
+    writeln!(uart, "Loaded {} bytes from /bin/user-init.run.", runSize).unwrap();
+
     unsafe {
         let scheduler = &raw mut SCHEDULER;
         (*scheduler) = Some(Scheduler::new());
@@ -2386,7 +2881,7 @@ pub extern "C" fn rust_start() -> ! {
             //scheduler.add_task(task_b);
             scheduler.add_task(task_c);
             //scheduler.add_user_task(user_test);
-            scheduler.add_user_task();
+            scheduler.add_user_task(runData);
         }
     }
     writeln!(uart, "Scheduler initialised!").unwrap();

@@ -17,7 +17,11 @@ cargo build --release
 
 echo "=== Build complete ==="
 echo "Generated user-init.run and rebuilt the kernel."
-
+# rm -f ouroboros.img # Leave off if you don't want to delete the image
+if [[ ! -f ouroboros.img ]]; then
+    echo "=== Creating 512 MiB disk image ==="
+    truncate -s 512M ouroboros.img
+fi
 if command -v qemu-system-aarch64 >/dev/null 2>&1; then
     echo "=== Launching QEMU ==="
     qemu-system-aarch64 \
