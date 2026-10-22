@@ -74,7 +74,7 @@ static mut STACK: KernelStack = KernelStack([0; 16 * 1024]);
 // Tasks
 // ============================================================
 const TASK_STACK_SIZE: usize = 16 * 1024;
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 64;
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskState {
@@ -160,7 +160,6 @@ const USER_CODE_BASE: usize = 0x8000_0000;
 const USER_HEAP_START: usize = 0x8001_0000;
 const USER_HEAP_END: usize = USER_STACK_TOP as usize - USER_STACK_SIZE;
 static mut USER_HEAP_NEXT: [usize; MAX_TASKS] = [USER_HEAP_START; MAX_TASKS];
-static USER_RUN: &[u8] = include_bytes!("../user-init/user-init.run");
 
 // OuroFS currently supports files using 12 direct data blocks.
 const MAX_RUN_SIZE: usize = 12 * 4096;
@@ -2078,6 +2077,155 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 };
                 return;
             }
+            6 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let data_ptr = frame.x[2] as usize;
+                let data_len = frame.x[3] as usize;
+
+                let path_end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                let data_end = match data_ptr.checked_add(data_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || path_end > VMAP_END || data_ptr < VMAP_START || data_end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.createFilePath(path, data) {
+                            Ok(inode) => frame.x[0] = inode as u64,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            }
+            7 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let buffer_ptr = frame.x[2] as usize;
+                let buffer_len = frame.x[3] as usize;
+
+                let path_end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                let buffer_end = match buffer_ptr.checked_add(buffer_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || path_end > VMAP_END || buffer_ptr < VMAP_START || buffer_end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_ptr as *mut u8, buffer_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.readFilePath(path, buffer) {
+                            Ok(size) => frame.x[0] = size as u64,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            }
+            8 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let data_ptr = frame.x[2] as usize;
+                let data_len = frame.x[3] as usize;
+
+                let path_end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                let data_end = match data_ptr.checked_add(data_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || path_end > VMAP_END || data_ptr < VMAP_START || data_end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.writeFilePath(path, data) {
+                            Ok(size) => frame.x[0] = size as u64,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            }
+            9 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.deleteFilePath(path) {
+                            Ok(()) => frame.x[0] = 0,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            },
             10 =>{
                 let ptr = frame.x[0] as usize;
                 let len = frame.x[1] as usize;
@@ -2100,7 +2248,6 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 unsafe{
                     core::ptr::copy_nonoverlapping(ptr as *const u8, path.as_mut_ptr(), len);
                 }
-                let scheduler_ptr = &raw mut SCHEDULER;
                 let filesystem_ptr = &raw mut FILESYSTEM_PTR;
                 unsafe {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
@@ -2125,7 +2272,264 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
 
                 return;
             },
-            
+            11 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.createDirectoryPath(path) {
+                            Ok(inode) => frame.x[0] = inode as u64,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            }
+            12 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_ptr < VMAP_START || end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    if let Some(filesystem) = (*filesystem_ptr).as_mut() {
+                        match filesystem.removeDirectoryPath(path) {
+                            Ok(()) => frame.x[0] = 0,
+                            Err(()) => frame.x[0] = u64::MAX,
+                        }
+                    } else {
+                        frame.x[0] = u64::MAX;
+                    }
+                }
+                return;
+            }
+            13 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+                if path_len == 0 || path_len > 512 || path_ptr < VMAP_START || end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let mut path = [0u8; 512];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(path_ptr as *const u8, path.as_mut_ptr(), path_len);
+                }
+
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                let scheduler_ptr = &raw mut SCHEDULER;
+                unsafe {
+                    let filesystem = match (*filesystem_ptr).as_mut() {
+                        Some(filesystem) => filesystem,
+                        None => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+                    let scheduler = match (*scheduler_ptr).as_mut() {
+                        Some(scheduler) => scheduler,
+                        None => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+                    if scheduler.tasks.count >= MAX_TASKS {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+
+                    let run_buffer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(RUN_LOAD_BUFFER).cast::<u8>(),
+                            MAX_RUN_SIZE,
+                        )
+                    };
+                    let run_size = match filesystem.readFilePath(&path[..path_len], run_buffer) {
+                        Ok(size) => size,
+                        Err(()) => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+
+                    if run_size == 0 || run_size > MAX_RUN_SIZE {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+
+                    let run_data = core::slice::from_raw_parts(
+                        core::ptr::addr_of!(RUN_LOAD_BUFFER).cast::<u8>(),
+                        run_size,
+                    );
+
+                    frame.x[0] = scheduler.add_user_task(run_data) as u64;
+                }
+                return;
+            }
+            14 => {
+                let path_ptr = frame.x[0] as usize;
+                let path_len = frame.x[1] as usize;
+                let buffer_ptr = frame.x[2] as usize;
+                let buffer_len = frame.x[3] as usize;
+
+                if path_len == 0
+                    || path_len > 512
+                    || buffer_len == 0
+                    || buffer_len > MAX_RUN_SIZE
+                {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                let path_end = match path_ptr.checked_add(path_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+
+                let buffer_end = match buffer_ptr.checked_add(buffer_len) {
+                    Some(end) => end,
+                    None => {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+                };
+
+                if path_ptr < VMAP_START
+                    || path_end > VMAP_END
+                    || buffer_ptr < VMAP_START
+                    || buffer_end > VMAP_END
+                {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+
+                // Copy the path before accessing the output buffer.
+                let mut path = [0u8; 512];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        path_ptr as *const u8,
+                        path.as_mut_ptr(),
+                        path_len,
+                    );
+                }
+
+                let output = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        buffer_ptr as *mut u8,
+                        buffer_len,
+                    )
+                };
+
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+
+                unsafe {
+                    let filesystem = match (*filesystem_ptr).as_mut() {
+                        Some(filesystem) => filesystem,
+                        None => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+
+                    let stat = match filesystem.statPath(&path[..path_len]) {
+                        Ok(stat) => stat,
+                        Err(()) => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+
+                    if stat.kind != filesystem::FileKind::Directory {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+
+                    let mut written = 0usize;
+                    let mut overflow = false;
+
+                    let result = filesystem.listDirectory(
+                        stat.inode,
+                        |name, _inode, _kind| {
+                            if overflow {
+                                return;
+                            }
+
+                            // Each entry is a name followed by '\n'.
+                            let entry_len = match name.len().checked_add(1) {
+                                Some(length) => length,
+                                None => {
+                                    overflow = true;
+                                    return;
+                                }
+                            };
+
+                            let end = match written.checked_add(entry_len) {
+                                Some(end) => end,
+                                None => {
+                                    overflow = true;
+                                    return;
+                                }
+                            };
+
+                            if end > output.len() {
+                                overflow = true;
+                                return;
+                            }
+
+                            output[written..written + name.len()]
+                                .copy_from_slice(name);
+
+                            output[written + name.len()] = b'\n';
+                            written = end;
+                        },
+                    );
+
+                    if result.is_err() || overflow {
+                        frame.x[0] = u64::MAX;
+                    } else {
+                        frame.x[0] = written as u64;
+                    }
+                }
+
+                return;
+            }
             42 => {
                 writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
                 return;
@@ -2829,28 +3233,6 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "================================").unwrap();
     writeln!(uart, "        OUROFS PATH PASS        ").unwrap();
     writeln!(uart, "================================").unwrap();
-
-    // Install the embedded user program into OuroFS the first time it is
-    // needed. Once installed, the scheduler loads the copy stored on disk.
-    if filesystem.resolvePath(b"/bin").is_err() {
-        filesystem
-            .createDirectoryPath(b"/bin")
-            .expect("Failed to create /bin in OuroFS");
-    }
-
-    if filesystem.resolvePath(b"/bin/user-init.run").is_err() {
-        assert!(
-            USER_RUN.len() <= MAX_RUN_SIZE,
-            "Embedded user-init.run exceeds OuroFS's current 48 KiB file limit"
-        );
-
-        filesystem
-            .createFilePath(b"/bin/user-init.run", USER_RUN)
-            .expect("Failed to install user-init.run into OuroFS");
-
-        writeln!(uart, "Installed /bin/user-init.run into OuroFS.").unwrap();
-    }
-
     // Read the executable from the filesystem into static storage. Do not
     // use a large local array here: the kernel stack is only 16 KiB.
     let runSize = unsafe {
