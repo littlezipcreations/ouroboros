@@ -5,7 +5,7 @@ mod syscall;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
-fn writeNumber(mut value: u64) {
+fn write_number(mut value: u64) {
     let mut buffer = [0u8; 20];
     let mut cursor = buffer.len();
 
@@ -22,22 +22,223 @@ fn writeNumber(mut value: u64) {
 
     syscall::sys_write(&buffer[cursor..]);
 }
+
+fn write_hex_byte(value: u8) {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let low = TABLE[(value & 0x0f) as usize];
+    let high = TABLE[((value >> 4) & 0x0f) as usize];
+    syscall::sys_write(&[high, low]);
+}
+
+fn write_hex_u64(mut value: u64) {
+    let mut buffer = [0u8; 16];
+    let mut index = buffer.len();
+
+    while index > 0 {
+        index -= 1;
+        buffer[index] = b"0123456789abcdef"[(value & 0xf) as usize];
+        value >>= 4;
+    }
+
+    syscall::sys_write(&buffer);
+}
+
+fn strip_spaces(bytes: &[u8]) -> &[u8] {
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+
+    &bytes[start..end]
+}
+
+fn read_line(buffer: &mut [u8]) -> usize {
+    let mut length = 0usize;
+
+    loop {
+        let byte = match syscall::read_byte() {
+            Some(byte) => byte,
+            None => {
+                syscall::yield_now();
+                continue;
+            }
+        };
+
+        match byte {
+            b'\r' | b'\n' => {
+                syscall::sys_write(b"\r\n");
+                return length;
+            }
+            8 | 127 => {
+                if length > 0 {
+                    length -= 1;
+                    syscall::sys_write(b"\x08 \x08");
+                }
+            }
+            0x20..=0x7e => {
+                if length < buffer.len() {
+                    buffer[length] = byte;
+                    length += 1;
+                    syscall::sys_write(&[byte]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_hex_dump(bytes: &[u8]) {
+    if bytes.is_empty() {
+        syscall::sys_write(b"(empty)\r\n");
+        return;
+    }
+
+    for offset in (0..bytes.len()).step_by(16) {
+        let line = &bytes[offset..bytes.len().min(offset + 16)];
+
+        write_hex_u64(offset as u64);
+        syscall::sys_write(b": ");
+
+        for (index, byte) in line.iter().enumerate() {
+            if index == 8 {
+                syscall::sys_write(b" ");
+            }
+            write_hex_byte(*byte);
+            syscall::sys_write(b" ");
+        }
+
+        for _ in 0..(16 - line.len()) {
+            syscall::sys_write(b"   ");
+        }
+        if line.len() <= 8 {
+            syscall::sys_write(b" ");
+        }
+
+        syscall::sys_write(b"|");
+        for byte in line {
+            let printable = *byte >= 0x20 && *byte <= 0x7e;
+            syscall::sys_write(&[if printable { *byte } else { b'.' }]);
+        }
+        syscall::sys_write(b"|\r\n");
+    }
+}
+
+fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
+    let mut text_length = match syscall::read_file(path, scratch) {
+        Some(count) => count,
+        None => 0,
+    };
+
+    if text_length > 0 {
+        syscall::sys_write(b"Current contents:\r\n");
+        syscall::sys_write(&scratch[..text_length]);
+        if !scratch[..text_length].ends_with(b"\n") {
+            syscall::sys_write(b"\r\n");
+        }
+        syscall::sys_write(b"--- end of file ---\r\n");
+    } else {
+        syscall::sys_write(b"New file (empty)\r\n");
+    }
+
+    let mut line = [0u8; 128];
+
+    loop {
+        syscall::sys_write(b"edit> ");
+        let line_length = read_line(&mut line);
+        let command = strip_spaces(&line[..line_length]);
+
+        if command.is_empty() {
+            if text_length + 1 <= scratch.len() {
+                scratch[text_length] = b'\n';
+                text_length += 1;
+            } else {
+                syscall::sys_write(b"edit: buffer full\r\n");
+            }
+            continue;
+        }
+
+        match command {
+            b":help" => {
+                syscall::sys_write(
+                    b"Command summary: :view, :w save, :q quit, :wq save+quit\r\n"
+                );
+            }
+            b":view" | b":list" => {
+                if text_length > 0 {
+                    syscall::sys_write(&scratch[..text_length]);
+                    if !scratch[..text_length].ends_with(b"\n") {
+                        syscall::sys_write(b"\r\n");
+                    }
+                } else {
+                    syscall::sys_write(b"(empty)\r\n");
+                }
+            }
+            b":w" | b":write" => {
+                match syscall::write_file(path, &scratch[..text_length]) {
+                    Some(count) => {
+                        syscall::sys_write(b"Saved ");
+                        write_number(count as u64);
+                        syscall::sys_write(b" bytes to ");
+                        syscall::sys_write(path);
+                        syscall::sys_write(b"\r\n");
+                    }
+                    None => {
+                        syscall::sys_write(b"edit: save failed\r\n");
+                    }
+                }
+            }
+            b":q" | b":quit" => {
+                syscall::sys_write(b"Edit cancelled.\r\n");
+                return false;
+            }
+            b":wq" | b":writequit" => {
+                match syscall::write_file(path, &scratch[..text_length]) {
+                    Some(count) => {
+                        syscall::sys_write(b"Saved ");
+                        write_number(count as u64);
+                        syscall::sys_write(b" bytes to ");
+                        syscall::sys_write(path);
+                        syscall::sys_write(b"\r\n");
+                        return true;
+                    }
+                    None => {
+                        syscall::sys_write(b"edit: save failed\r\n");
+                    }
+                }
+            }
+            _ => {
+                if text_length + command.len() + 1 > scratch.len() {
+                    syscall::sys_write(b"edit: buffer full\r\n");
+                    continue;
+                }
+
+                scratch[text_length..text_length + command.len()].copy_from_slice(command);
+                text_length += command.len();
+                scratch[text_length] = b'\n';
+                text_length += 1;
+            }
+        }
+    }
+}
+
 fn shell() -> ! {
     const FILE_BUFFER_PAGES: usize = 12;
     const FILE_BUFFER_SIZE: usize = FILE_BUFFER_PAGES * 4096;
 
     // Reuse this buffer for file operations instead of allocating
     // memory every time someone runs cat.
-    let fileBuffer = syscall::alloc_pages(FILE_BUFFER_PAGES);
+    let file_buffer = syscall::alloc_pages(FILE_BUFFER_PAGES);
 
-    if fileBuffer.is_none() {
+    if file_buffer.is_none() {
         syscall::sys_write(
             b"Warning: filesystem buffer allocation failed.\r\n"
         );
     }
 
     let mut line = [0u8; 128];
-    let mut ignoreNextLf = false;
+    let mut ignore_next_lf = false;
 
     loop {
         syscall::sys_write(b"ouro> ");
@@ -53,8 +254,8 @@ fn shell() -> ! {
                 }
             };
 
-            if ignoreNextLf {
-                ignoreNextLf = false;
+            if ignore_next_lf {
+                ignore_next_lf = false;
 
                 if byte == b'\n' {
                     continue;
@@ -63,7 +264,7 @@ fn shell() -> ! {
 
             match byte {
                 b'\r' => {
-                    ignoreNextLf = true;
+                    ignore_next_lf = true;
                     syscall::sys_write(b"\r\n");
                     break;
                 }
@@ -103,10 +304,65 @@ fn shell() -> ! {
         // ----------------------------------------------------
         if command == b"help" {
             syscall::sys_write(
-                b"Commands: help, stat, cat, touch, write,\r\n\
-                  \x20         rm, mkdir, rmdir, run\r\n\
+                b"Commands: help, stat, cat, ls, touch, write,\r\n\
+                  \x20         rm, mkdir, rmdir, run, edit, hex\r\n\
                   Paths must be absolute.\r\n"
             );
+        }
+
+        // ----------------------------------------------------
+        // hex <path>
+        // ----------------------------------------------------
+        else if command.starts_with(b"hex ") {
+            let path = strip_spaces(&command[4..]);
+
+            if path.is_empty() {
+                syscall::sys_write(b"Usage: hex /path\r\n");
+                continue;
+            }
+
+            let buffer = match file_buffer {
+                Some(ptr) => unsafe {
+                    core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
+                },
+                None => {
+                    syscall::sys_write(b"hex: buffer allocation failed\r\n");
+                    continue;
+                }
+            };
+
+            match syscall::read_file(path, buffer) {
+                Some(count) => {
+                    print_hex_dump(&buffer[..count]);
+                }
+                None => {
+                    syscall::sys_write(b"hex: read failed\r\n");
+                }
+            }
+        }
+
+        // ----------------------------------------------------
+        // edit <path>
+        // ----------------------------------------------------
+        else if command.starts_with(b"edit ") {
+            let path = strip_spaces(&command[5..]);
+
+            if path.is_empty() {
+                syscall::sys_write(b"Usage: edit /path\r\n");
+                continue;
+            }
+
+            let buffer = match file_buffer {
+                Some(ptr) => unsafe {
+                    core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
+                },
+                None => {
+                    syscall::sys_write(b"edit: buffer allocation failed\r\n");
+                    continue;
+                }
+            };
+
+            let _ = edit_file(path, buffer);
         }
 
         // ----------------------------------------------------
@@ -118,10 +374,10 @@ fn shell() -> ! {
             match syscall::stat(path) {
                 Some(info) => {
                     syscall::sys_write(b"inode: ");
-                    writeNumber(info.inode);
+                    write_number(info.inode);
 
                     syscall::sys_write(b"\r\nsize: ");
-                    writeNumber(info.size);
+                    write_number(info.size);
 
                     syscall::sys_write(b"\r\ntype: ");
 
@@ -134,7 +390,7 @@ fn shell() -> ! {
                     }
 
                     syscall::sys_write(b"\r\nlinks: ");
-                    writeNumber(info.links);
+                    write_number(info.links);
                     syscall::sys_write(b"\r\n");
                 }
 
@@ -152,7 +408,7 @@ fn shell() -> ! {
         else if command.starts_with(b"cat ") {
             let path = &command[4..];
 
-            let bufferPtr = match fileBuffer {
+            let buffer_ptr = match file_buffer {
                 Some(ptr) => ptr,
                 None => {
                     syscall::sys_write(
@@ -164,7 +420,7 @@ fn shell() -> ! {
 
             let output = unsafe {
                 core::slice::from_raw_parts_mut(
-                    bufferPtr,
+                    buffer_ptr,
                     FILE_BUFFER_SIZE,
                 )
             };
@@ -197,7 +453,7 @@ fn shell() -> ! {
         else if command.starts_with(b"touch ") {
             let path = &command[6..];
 
-            let bufferPtr = match fileBuffer {
+            let buffer_ptr = match file_buffer {
                 Some(ptr) => ptr,
                 None => {
                     syscall::sys_write(
@@ -209,14 +465,14 @@ fn shell() -> ! {
 
             // The zero-length slice points into allocated
             // userspace memory, rather than kernel text.
-            let emptyData = unsafe {
-                core::slice::from_raw_parts(bufferPtr, 0)
+            let empty_data = unsafe {
+                core::slice::from_raw_parts(buffer_ptr, 0)
             };
 
-            match syscall::create_file(path, emptyData) {
+            match syscall::create_file(path, empty_data) {
                 Some(inode) => {
                     syscall::sys_write(b"Created inode ");
-                    writeNumber(inode as u64);
+                    write_number(inode as u64);
                     syscall::sys_write(b"\r\n");
                 }
 
@@ -243,7 +499,7 @@ fn shell() -> ! {
                     match syscall::write_file(path, contents) {
                         Some(count) => {
                             syscall::sys_write(b"Wrote ");
-                            writeNumber(count as u64);
+                            write_number(count as u64);
                             syscall::sys_write(b" bytes\r\n");
                         }
 
@@ -287,7 +543,7 @@ fn shell() -> ! {
             match syscall::create_dir(path) {
                 Some(inode) => {
                     syscall::sys_write(b"Created directory inode ");
-                    writeNumber(inode as u64);
+                    write_number(inode as u64);
                     syscall::sys_write(b"\r\n");
                 }
 
@@ -319,11 +575,11 @@ fn shell() -> ! {
         // ----------------------------------------------------
         else if command.starts_with(b"run ") {
             let path = &command[4..];
-
+            if path == b"/bin/user-init.run"{syscall::sys_write(b"You should NOT be trying to open a nested shell.\r\n"); continue;}
             match syscall::spawn(path) {
-                Some(taskId) => {
+                Some(task_id) => {
                     syscall::sys_write(b"Started task ");
-                    writeNumber(taskId as u64);
+                    write_number(task_id as u64);
                     syscall::sys_write(b"\r\n");
                 }
 
@@ -357,7 +613,7 @@ fn shell() -> ! {
                 path = b"/";
             }
 
-            let buffer = match fileBuffer {
+            let buffer = match file_buffer {
                 Some(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, 12 * 4096)
                 },
