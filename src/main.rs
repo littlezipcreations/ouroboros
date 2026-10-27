@@ -1529,7 +1529,6 @@ impl Gic {
         self.write_cpu(0x004, 0xFF);
         writeln!(uart, "Enabling GIC CPU interface...").ok();
         self.write_cpu(0x000, 1);
-        writeln!(uart, "GIC enabled! Returning to main...").ok();
     }
 }
 // ============================================================
@@ -3193,7 +3192,7 @@ pub extern "C" fn rust_start() -> ! {
     writeln!(uart, "Enabling GIC...").unwrap();
     let gic = Gic::new();
     gic.enable();
-    writeln!(uart, "GIC enabled! Returned to main!").unwrap();
+    writeln!(uart, "GIC enabled!").unwrap();
     writeln!(uart, "Reading timer...").unwrap();
     let freq = Timer::frequency();
     let _counter = Timer::counter();

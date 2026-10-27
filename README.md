@@ -5,11 +5,13 @@ I will first explain how this kernel is run on my system (or if you are savvy-en
 Ouroboros is designed for Arm Cortex CPUs, with the Arm Cortex-A76 the focus (although it runs on any such CPU at least as early as the Arm Cortex-A53 being the earliest I have tested). I do not plan to support x86-64 CPUs, RISC V CPUs or any other aarch64 CPUs.
 I personally use QEMU to run Ouroboros, with my script found in [`build-and-run.sh`](build-and-run.sh)
 This is a bash script designed to run on raspbian, with my setup. If you aren't compiling the kernel, and just want to run it, you only need:
-> qemu-system-aarch64 -M virt -global virtio-mmio.force-legacy=false -cpu cortex-a76 -m 512M -display sdl -serial file:/tmp/ouroboros-uart.log -monitor stdio -kernel compiled/ouroboros -drive if=none,file=ouroboros.img,format=raw,id=ouroDisk -device virtio-blk-device,drive=ouroDisk -device virtio-gpu-device -nographic
+> qemu-system-aarch64 -M virt -global virtio-mmio.force-legacy=false -cpu cortex-a76 -m 512M -monitor stdio -kernel compiled/ouroboros -drive if=none,file=ouroboros.img,format=raw,id=ouroDisk -device virtio-blk-device,drive=ouroDisk -device virtio-gpu-device -nographic
+
 (This is presuming you are looking at the release repo, and not the source.)
 Graphics for Ouroboros is not finished in this version, but it inits correctly, and so I will leave it in the kernel.
 For this to work, you need a version of QEMU that can run aarch64 CPUs on your computer. This can be found:
 >https://www.qemu.org/download/
+
 but I will leave this to you to work out.
 
 ## What is Ouroboros actually doing?
@@ -79,3 +81,90 @@ The L1_LOW table contains L2_DEVICE at [0], L2_RAM at [1], and L2_VMAP at [2]. T
 #### L2_DEVICE
 This contains links to addresses for UART(0x09000000)[72], and the GIC Interrupt Controller(0x08000000)[64].
 These are necessary, as accessing these devices would otherwise be impossible after MMU initialisation.
+
+#### L2_RAM
+Here we assign the the L3 Table at [0] and then 255 more pages of L2 RAM for kernel use after that.
+
+#### L2_VMAP
+Much like the L3 Table is at L2_RAM[0], the VMAP L3 Table is at L2_VMAP[0]. We do not assign any more pages here, however.
+
+#### L3_RAM
+For this table, we assign 512 4KiB pages, to be used by the kernel and by tasks that Ouroboros is running.
+
+### VirtIO GPU (This is still WIP)
+First, we initialise a new GPU struct from [`src/virtio_gpu.rs`](src/virtio_gpu.rs).
+I will not explain the full workings of that script here, only what is used directly by the kernel.
+That information will be in a seperate README.
+We then probe the GPU for some metadata, namely the magic, version, and what device it is.
+This is because (although it is coded to read from the right address), we do need to be robust, and check that we are not making any assumptions.
+Then, the GPU is initialised. 
+The kernel informs us whether or not this succeeded, but continues no matter what.
+We then fetch the info about the display the GPU is outputting to.
+If there is no display, that would not be a kernel issue perhaps, because the GPU is designed to be able to withstand this.
+
+### Filesystem and Drive
+Ouroboros makes use of a drive format I designed, aptly named "OuroFS". 
+This is simply for development ease on my part, and I do plan to later expand Ouroboros to be able to use other formats, such as ext4 or FAT drives.
+Documentation on OuroFS and [`src/filesystem.rs`](src/filesystem.rs) will be in a seperate README.
+If there is no drive, QEMU prematurely throws an error, so this is not a failcase the kernel handles.
+If the drive is not formatted to OuroFS, we format it.
+Otherwise, we mount it directly.
+The kernel then prints some diagnostic information on the drive, such as its size, and the block size it has been formatted with.
+
+The kernel then automatically loads user-init.run (our shell program) for the drive. 
+It does try to continue execution, but Ouroboros doesn't actually do much without a shell. You effectively end up with an initialised, yet idle CPU.
+The kernel does **NOT** load the shell into the stack. This is only 16KiB in size, and the kernel crashes due to a stack overflow.
+It stores the program in a 49.1 KiB buffer (the old maximum size for a .run executable).
+If this buffer is exceeded, the shell will half-load, but cut off at the max size of the buffer.
+The kernel will inform you if the provided shell does not fit inside the buffer.
+
+### Scheduler
+We then initialise the scheduler.
+The scheduler holds:
+- A TaskTable of Tasks
+- The usize ID of the current task
+- The current state of the task
+- Which task is in foreground (if the task has spawned another task that it has passed to)
+The scheduler has options to:
+- Add a new task (a task that will execute as part of the kernel)
+- Add a new user task (a task that will execute in userspace)
+- Search for the next task that is ready to execute
+- Start a task
+- Tick (Switch tasks and update states)
+Used by syscalls, and not by the scheduler without interrupts, there are also options to:
+- Yield current task (pass execution to another task, and not kill the current task)
+- Exit task (pass execution to another task, and kill the current task)
+- Switch to a task (i.e., put a task in foreground)
+- Spawn a foreground task (which uses the function above).
+When the scheduler is first initialised, two tasks are provided.
+- The idle task(kernel level, spins CPU loop. This is a fallback to avoid stopping execution)
+- user-init.run (user level, this is our shell task)
+The scheduler is biased against executing the idle task unless all other tasks are occupied or dead.
+
+### GIC (Generic Interrupt Controller)
+We next initialise the GIC.
+This takes interrupts from peripheries, including the timer, and passes them on to the kernel.
+This allows us to use our scheduling system.
+
+### Timer
+We then read the metadata about the timer provided (its frequency and counter).
+We set the timer to fire once every 100ms, and enable it.
+This allows us to use the timer interrupts to tick the scheduler.
+
+### CPU IRQs and wfe
+Finally, we enable IRQs. 
+This lets the kernel uses the interrupts from the timer, and the scheduler starts execution.
+The kernel is designed to run in a loop afterwards. This is so that execution does not stop if the scheduler fails to load.
+
+With this done, the initialisation has finished its job.
+Information about how the shell works, or how to write programs for Ouroboros, will be in seperate READMEs.
+
+## Design philosophy
+Ouroboros is designed to be a powerful, yet transparent OS.
+I find that modern OSes do not lend themselves very well to tinkerers like me, or people who want to know how things work.
+Ouroboros, conversely, is designed to be readable to anyone who can read Rust.
+That is one reason why this README goes more indepth than perhaps it should.
+By providing little abstraction at each layer, it is possible to trace the execution of a program.
+This not only aids understanding, but also forces programmers to acknowledge constraints directly.
+Optimisations, I believe, should be key, rather than placing emphasis on bloat and ease of development.
+This is why, what seem like strict constraints, such as 512MiB of RAM and storage, and a max file size of 12 pages, should be quite luxurious for those using Ouroboros.
