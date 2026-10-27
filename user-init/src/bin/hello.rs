@@ -2,7 +2,7 @@
 #![no_main]
 
 #[path = "../syscall.rs"]
-mod syscall;
+use ouroboros_system::syscall;
 
 use core::panic::PanicInfo;
 

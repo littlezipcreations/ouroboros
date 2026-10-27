@@ -514,6 +514,41 @@ impl FileSystem {
         }
         Err(())
     }
+
+    pub fn disk_usage(&mut self) -> Result<(u64, u64, u64, u64), ()> {
+        let total_data_blocks = self.superblock.total_blocks.saturating_sub(self.superblock.data_start);
+        let mut used_blocks = 0u64;
+        let mut bit_index = 0usize;
+
+        for bitmap_block_index in 0..self.superblock.block_bitmap_blocks {
+            let bitmap_block = self.superblock.block_bitmap_start + bitmap_block_index;
+            let mut bitmap = [0u8; BLOCK_SIZE];
+
+            self.disk.read_block(bitmap_block, &mut bitmap).map_err(|_| ())?;
+
+            for byte in bitmap.iter() {
+                if bit_index >= total_data_blocks as usize {
+                    let free_blocks = total_data_blocks.saturating_sub(used_blocks);
+                    return Ok((total_data_blocks, used_blocks, free_blocks, BLOCK_SIZE as u64));
+                }
+
+                for bit in 0..8 {
+                    if bit_index >= total_data_blocks as usize {
+                        let free_blocks = total_data_blocks.saturating_sub(used_blocks);
+                        return Ok((total_data_blocks, used_blocks, free_blocks, BLOCK_SIZE as u64));
+                    }
+
+                    if byte & (1u8 << bit) != 0 {
+                        used_blocks += 1;
+                    }
+                    bit_index += 1;
+                }
+            }
+        }
+
+        let free_blocks = total_data_blocks.saturating_sub(used_blocks);
+        Ok((total_data_blocks, used_blocks, free_blocks, BLOCK_SIZE as u64))
+    }
     fn freeBlock(&mut self, blockNumber: u64) -> Result<(), ()> {
         if blockNumber < self.superblock.data_start
             || blockNumber >= self.superblock.total_blocks

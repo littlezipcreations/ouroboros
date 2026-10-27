@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
 
-mod syscall;
+use ouroboros_system::syscall;
+use ouroboros_system::console;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
@@ -52,6 +53,81 @@ fn strip_spaces(bytes: &[u8]) -> &[u8] {
         .unwrap_or(start);
 
     &bytes[start..end]
+}
+
+fn parse_usize(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value = 0usize;
+
+    for &byte in bytes {
+        if !(b'0'..=b'9').contains(&byte) {
+            return None;
+        }
+
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+    }
+
+    Some(value)
+}
+
+fn replace_line(buffer: &mut [u8], text_length: &mut usize, line_number: usize, new_text: &[u8]) -> bool {
+    if line_number == 0 {
+        return false;
+    }
+
+    let mut line_index = 1usize;
+    let mut line_start = 0usize;
+    let mut line_end = 0usize;
+    let mut match_start = 0usize;
+    let mut match_end = 0usize;
+    let mut found = false;
+
+    while line_end <= *text_length {
+        if line_end == *text_length || buffer[line_end] == b'\n' {
+            if line_index == line_number {
+                match_start = line_start;
+                match_end = line_end;
+                found = true;
+                break;
+            }
+
+            line_start = line_end + 1;
+            line_index += 1;
+        }
+        line_end += 1;
+    }
+
+    if !found {
+        return false;
+    }
+
+    let kept_newline = if match_end < *text_length && buffer[match_end] == b'\n' { 1usize } else { 0usize };
+    let old_line_length = match_end - match_start;
+    let new_length = new_text.len();
+    let tail_start = match_end + kept_newline;
+    let tail_length = *text_length - tail_start;
+    let after_replace_size = new_length + kept_newline;
+    let removed_size = old_line_length + kept_newline;
+    let new_total = *text_length - removed_size + after_replace_size;
+
+    if new_total > buffer.len() {
+        return false;
+    }
+
+    for index in (0..tail_length).rev() {
+        buffer[match_start + after_replace_size + index] = buffer[tail_start + index];
+    }
+
+    buffer[match_start..match_start + new_length].copy_from_slice(new_text);
+    if kept_newline == 1 {
+        buffer[match_start + new_length] = b'\n';
+    }
+
+    *text_length = new_total;
+    true
 }
 
 fn read_line(buffer: &mut [u8]) -> usize {
@@ -162,7 +238,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
         match command {
             b":help" => {
                 syscall::sys_write(
-                    b"Command summary: :view, :w save, :q quit, :wq save+quit\r\n"
+                    b"Command summary: :view, :replace N text, :w save, :q quit, :wq save+quit\r\n"
                 );
             }
             b":view" | b":list" => {
@@ -173,6 +249,58 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                     }
                 } else {
                     syscall::sys_write(b"(empty)\r\n");
+                }
+            }
+            _ if command.starts_with(b":replace ") => {
+                let rest = strip_spaces(&command[9..]);
+                let separator = match rest.iter().position(|&byte| byte == b' ') {
+                    Some(index) => index,
+                    None => {
+                        syscall::sys_write(b"Usage: :replace N text\r\n");
+                        continue;
+                    }
+                };
+
+                let line_number = match parse_usize(&rest[..separator]) {
+                    Some(value) => value,
+                    None => {
+                        syscall::sys_write(b"replace: line number must be numeric\r\n");
+                        continue;
+                    }
+                };
+
+                let new_text = strip_spaces(&rest[separator + 1..]);
+
+                if replace_line(scratch, &mut text_length, line_number, new_text) {
+                    syscall::sys_write(b"Line updated.\r\n");
+                } else {
+                    syscall::sys_write(b"replace: bad line number or buffer too small\r\n");
+                }
+            }
+            _ if command.starts_with(b":edit ") => {
+                let rest = strip_spaces(&command[6..]);
+                let separator = match rest.iter().position(|&byte| byte == b' ') {
+                    Some(index) => index,
+                    None => {
+                        syscall::sys_write(b"Usage: :edit N text\r\n");
+                        continue;
+                    }
+                };
+
+                let line_number = match parse_usize(&rest[..separator]) {
+                    Some(value) => value,
+                    None => {
+                        syscall::sys_write(b"edit: line number must be numeric\r\n");
+                        continue;
+                    }
+                };
+
+                let new_text = strip_spaces(&rest[separator + 1..]);
+
+                if replace_line(scratch, &mut text_length, line_number, new_text) {
+                    syscall::sys_write(b"Line updated.\r\n");
+                } else {
+                    syscall::sys_write(b"edit: bad line number or buffer too small\r\n");
                 }
             }
             b":w" | b":write" => {
@@ -224,6 +352,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
 }
 
 fn shell() -> ! {
+    console::write_line("Welcome to Ouroboros!");
     const FILE_BUFFER_PAGES: usize = 12;
     const FILE_BUFFER_SIZE: usize = FILE_BUFFER_PAGES * 4096;
 
@@ -304,10 +433,43 @@ fn shell() -> ! {
         // ----------------------------------------------------
         if command == b"help" {
             syscall::sys_write(
-                b"Commands: help, stat, cat, ls, touch, write,\r\n\
+                b"Commands: help, stat, cat, ls, df, touch, write,\r\n\
                   \x20         rm, mkdir, rmdir, run, edit, hex\r\n\
                   Paths must be absolute.\r\n"
             );
+        }
+
+        // ----------------------------------------------------
+        // df
+        // ----------------------------------------------------
+        else if command == b"df" || command.starts_with(b"df ") {
+            let usage = match syscall::disk_usage() {
+                Some(usage) => usage,
+                None => {
+                    syscall::sys_write(b"df: filesystem query failed\r\n");
+                    continue;
+                }
+            };
+
+            let total_kib = usage.total_blocks.saturating_mul(usage.block_size) / 1024;
+            let used_kib = usage.used_blocks.saturating_mul(usage.block_size) / 1024;
+            let available_kib = usage.available_blocks.saturating_mul(usage.block_size) / 1024;
+            let used_percent = if total_kib == 0 {
+                0
+            } else {
+                (used_kib * 100) / total_kib
+            };
+
+            syscall::sys_write(b"Filesystem     1K-blocks  Used Available Use% Mounted on\r\n");
+            syscall::sys_write(b"rootfs         ");
+            write_number(total_kib);
+            syscall::sys_write(b"  ");
+            write_number(used_kib);
+            syscall::sys_write(b"  ");
+            write_number(available_kib);
+            syscall::sys_write(b"  ");
+            write_number(used_percent);
+            syscall::sys_write(b"% /\r\n");
         }
 
         // ----------------------------------------------------
@@ -578,7 +740,7 @@ fn shell() -> ! {
             if path == b"/bin/user-init.run"{syscall::sys_write(b"You should NOT be trying to open a nested shell.\r\n"); continue;}
             match syscall::spawn(path) {
                 Some(task_id) => {
-                    syscall::sys_write(b"Started task ");
+                    syscall::sys_write(b"Completed task ");
                     write_number(task_id as u64);
                     syscall::sys_write(b"\r\n");
                 }

@@ -5,3 +5,6 @@ edition = "2024"
 
 [profile.release]
 panic = "abort"
+
+[dependencies]
+ouroboros-system = { path = "../system" }

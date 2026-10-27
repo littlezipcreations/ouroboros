@@ -10,6 +10,15 @@ pub struct FileStat {
     pub links: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilesystemUsage {
+    pub total_blocks: u64,
+    pub used_blocks: u64,
+    pub available_blocks: u64,
+    pub block_size: u64,
+}
+
 pub const FILE_KIND_FILE: u8 = 1;
 pub const FILE_KIND_DIRECTORY: u8 = 2;
 
@@ -290,6 +299,35 @@ pub fn list_directory(
         None
     } else {
         Some(result as usize)
+    }
+}
+
+#[inline(always)]
+pub fn disk_usage() -> Option<FilesystemUsage> {
+    let total: u64;
+    let used: u64;
+    let available: u64;
+    let block_size: u64;
+
+    unsafe {
+        asm!(
+            "svc #15",
+            lateout("x0") total,
+            lateout("x1") used,
+            lateout("x2") available,
+            lateout("x3") block_size,
+        );
+    }
+
+    if total == u64::MAX {
+        None
+    } else {
+        Some(FilesystemUsage {
+            total_blocks: total,
+            used_blocks: used,
+            available_blocks: available,
+            block_size,
+        })
     }
 }
 

@@ -5,6 +5,18 @@ mod exception;
 use exception::ExceptionFrame;
 mod virtio;
 use virtio::VirtioBlk;
+mod virtio_gpu;
+use virtio_gpu::VirtioGpu;
+mod virtio_input;
+use virtio_input::{
+    VirtioInput,
+    EV_KEY,
+    EV_REL,
+    REL_X,
+    REL_Y,
+    BTN_LEFT,
+    BTN_RIGHT,
+};
 mod filesystem;
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
@@ -213,7 +225,106 @@ fn run_read_u64(data: &[u8], offset: usize) -> u64 {
 fn run_align_up(value: usize) -> usize {
     (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
+fn validate_run(data: &[u8]) -> bool {
+    if data.len() < RUN_HEADER_SIZE || &data[0..4] != RUN_MAGIC {
+        return false;
+    }
 
+    if run_read_u16(data, 4) != RUN_VERSION
+        || run_read_u16(data, 6) != RUN_ARCH_AARCH64
+        || run_read_u16(data, 8) as usize != RUN_HEADER_SIZE
+    {
+        return false;
+    }
+
+    let segmentCount = run_read_u16(data, 10) as usize;
+    let entry = run_read_u64(data, 12);
+    let imageSize = run_read_u64(data, 24);
+
+    if segmentCount == 0
+        || segmentCount > RUN_MAX_SEGMENTS
+        || imageSize != data.len() as u64
+        || entry < VMAP_START as u64
+        || entry >= VMAP_END as u64
+    {
+        return false;
+    }
+
+    let tableEnd = match RUN_HEADER_SIZE
+        .checked_add(segmentCount * RUN_SEGMENT_SIZE)
+    {
+        Some(end) => end,
+        None => return false,
+    };
+
+    if tableEnd > data.len() {
+        return false;
+    }
+
+    let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
+    let mut maxEnd = VMAP_START;
+    let mut entryIsExecutable = false;
+
+    for i in 0..segmentCount {
+        let base = RUN_HEADER_SIZE + i * RUN_SEGMENT_SIZE;
+
+        let virtualAddress = run_read_u64(data, base) as usize;
+        let fileOffset = run_read_u64(data, base + 8) as usize;
+        let fileSize = run_read_u64(data, base + 16) as usize;
+        let memorySize = run_read_u64(data, base + 24) as usize;
+        let flags = run_read_u32(data, base + 32);
+
+        if memorySize == 0
+            || fileSize > memorySize
+            || virtualAddress % PAGE_SIZE != 0
+        {
+            return false;
+        }
+
+        let segmentEnd = match virtualAddress.checked_add(memorySize) {
+            Some(end) => end,
+            None => return false,
+        };
+
+        if virtualAddress < VMAP_START || segmentEnd > VMAP_END {
+            return false;
+        }
+
+        let fileEnd = match fileOffset.checked_add(fileSize) {
+            Some(end) => end,
+            None => return false,
+        };
+
+        if fileEnd > data.len() {
+            return false;
+        }
+
+        for j in 0..i {
+            let (otherStart, otherEnd) = ranges[j];
+
+            if !(segmentEnd <= otherStart || virtualAddress >= otherEnd) {
+                return false;
+            }
+        }
+
+        ranges[i] = (virtualAddress, segmentEnd);
+        maxEnd = maxEnd.max(segmentEnd);
+
+        if (flags & RUN_X) != 0
+            && entry >= virtualAddress as u64
+            && entry < segmentEnd as u64
+        {
+            entryIsExecutable = true;
+        }
+    }
+
+    if !entryIsExecutable {
+        return false;
+    }
+
+    let heapStart = run_align_up(maxEnd.max(USER_HEAP_START));
+    heapStart < USER_HEAP_END
+}
 fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
     assert!(data.len() >= RUN_HEADER_SIZE, ".run header too small");
     assert!(&data[0..4] == RUN_MAGIC, "invalid .run magic");
@@ -393,6 +504,11 @@ impl Task {
                 USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
 
             unsafe {
+                core::ptr::write_bytes(
+                    physical as *mut u8,
+                    0,
+                    PAGE_SIZE,
+                );
                 map_user_page(
                     &mut ADDRESS_SPACES[id],
                     virtual_address,
@@ -451,17 +567,42 @@ impl TaskTable {
         self.tasks[id] = Some(Task::new(id, entry));
         self.count += 1;
         id
-    }
-    fn create_user(&mut self, runData: &[u8]) -> usize {
-        if self.count >= MAX_TASKS {
-            panic!("No free task slots");
+    }      
+    fn available_slot(&self) -> Option<usize> {
+        if self.count == 0 {
+            return None;
         }
 
-        let id = self.count;
+        for id in 1..self.count {
+            let reusable = self.tasks[id].as_ref().map_or(true, |task| {
+                matches!(task.state, TaskState::Dead | TaskState::Unused)
+            });
+
+            if reusable {
+                return Some(id);
+            }
+        }
+
+        if self.count < MAX_TASKS {
+            Some(self.count)
+        } else {
+            None
+        }
+    }
+    fn create_user(&mut self, runData: &[u8]) -> usize {
+        let id = self
+            .available_slot()
+            .expect("No free task slots");
+
         self.tasks[id] = Some(Task::new_user(id, runData));
-        self.count += 1;
+
+        if id == self.count {
+            self.count += 1;
+        }
+
         id
     }
+
 }
 // ============================================================
 // Task trampoline / termination
@@ -1110,6 +1251,7 @@ struct Scheduler {
     tasks: TaskTable,
     current: usize,
     started: bool,
+    foreground: Option<(usize, usize)>,
 }
 impl Scheduler {
     fn new() -> Self {
@@ -1117,6 +1259,7 @@ impl Scheduler {
             tasks: TaskTable::new(),
             current: 0,
             started: false,
+            foreground: None,
         }
     }
     fn add_task(&mut self, entry: fn()) -> usize {
@@ -1214,22 +1357,62 @@ impl Scheduler {
         };
         self.switch_to_task(next, frame);
     }
+    
     fn exit_current(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
             panic!("No tasks");
         }
+
         if self.current == 0 {
             panic!("Idle task cannot exit");
         }
+
         let dead = self.current;
+
+        // Release this process's user mappings and physical pages.
+        reclaim_user_pages(dead);
+
         if let Some(task) = &mut self.tasks.tasks[dead] {
             task.state = TaskState::Dead;
         }
+
+        // Did the foreground child just exit?
+        let parentToResume = match self.foreground {
+            Some((parentId, childId)) if childId == dead => {
+                self.foreground = None;
+                Some(parentId)
+            }
+            _ => None,
+        };
+
+        if let Some(parentId) = parentToResume {
+            let parentReady =
+                if let Some(parent) = self.tasks.tasks[parentId].as_mut() {
+                    if parent.state == TaskState::Blocked {
+                        parent.state = TaskState::Ready;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+            if parentReady {
+                self.switch_to_task(parentId, frame);
+                return;
+            }
+        }
+
+        // Preserve the ordinary exit path for tasks that have no
+        // blocked foreground parent.
         for offset in 1..self.tasks.count {
             let id = (dead + offset) % self.tasks.count;
+
             if id == 0 {
                 continue;
             }
+
             if let Some(task) = &self.tasks.tasks[id] {
                 if task.state == TaskState::Ready {
                     self.switch_to_task(id, frame);
@@ -1237,8 +1420,10 @@ impl Scheduler {
                 }
             }
         }
+
         self.switch_to_task(0, frame);
     }
+
     fn switch_to_task(
         &mut self,
         id: usize,
@@ -1263,6 +1448,43 @@ impl Scheduler {
             switch_address_space(address_space_id);
         }
     }
+    fn spawn_foreground_user(
+        &mut self,
+        runData: &[u8],
+        frame: &mut ExceptionFrame,
+    ) -> bool {
+        // Only one foreground child may own the terminal at a time.
+        if self.current == 0
+            || self.foreground.is_some()
+            || self.tasks.available_slot().is_none()
+        {
+            return false;
+        }
+
+        let parentId = self.current;
+        let childId = self.add_user_task(runData);
+
+        // When the child exits, the parent will return from its
+        // spawn syscall with this task ID in x0.
+        frame.x[0] = childId as u64;
+
+        {
+            let parent = self.tasks.tasks[parentId]
+                .as_mut()
+                .expect("Current task missing");
+
+            parent.save_context(frame);
+            parent.state = TaskState::Blocked;
+        }
+
+        self.foreground = Some((parentId, childId));
+
+        // Save the child as the current context and start it.
+        self.switch_to_task(childId, frame);
+
+        true
+    }
+
 }
 
 // ============================================================
@@ -1566,6 +1788,58 @@ unsafe fn unmap_page(address_space: &mut AddressSpace, virt_addr: usize) {
     assert!(address_space.l3_vmap.entries[index].is_valid());
     address_space.l3_vmap.entries[index] = PageTableEntry::invalid();
 }
+
+fn reclaim_user_pages(addressSpaceId: usize) {
+    unsafe{
+        if addressSpaceId >= MAX_TASKS {
+            return;
+        }
+
+        // Each entry corresponds to one possible 4 KiB user page.
+        let mut physicalPages = [0usize; 512];
+        let mut pageCount = 0usize;
+
+        unsafe {
+            let addressSpaces = &raw mut ADDRESS_SPACES;
+            let entries =
+                &mut (*addressSpaces)[addressSpaceId].l3_vmap.entries;
+
+            for entry in entries.iter_mut() {
+                if entry.is_valid() {
+                    let physical =
+                        (entry.0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+                    *entry = PageTableEntry::invalid();
+
+                    physicalPages[pageCount] = physical;
+                    pageCount += 1;
+                }
+            }
+
+            let heapNext = &raw mut USER_HEAP_NEXT;
+            (*heapNext)[addressSpaceId] = USER_HEAP_START;
+
+            // Remove stale translations before releasing physical pages.
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack)
+            );
+        }
+
+        for physical in physicalPages[..pageCount].iter().copied() {
+            if physical >= FIRST_FREE_PAGE
+                && physical < RAM_END
+                && physical % PAGE_SIZE == 0
+            {
+                free_page(physical);
+            }
+        }
+    }   
+}
+
 // ============================================================
 // Page tables
 // ============================================================
@@ -2367,10 +2641,11 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                             return;
                         }
                     };
-                    if scheduler.tasks.count >= MAX_TASKS {
-                        frame.x[0] = u64::MAX;
-                        return;
-                    }
+                    if scheduler.foreground.is_some() || scheduler.tasks.available_slot().is_none()
+                        {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
 
                     let run_buffer = unsafe {
                         core::slice::from_raw_parts_mut(
@@ -2396,7 +2671,16 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                         run_size,
                     );
 
-                    frame.x[0] = scheduler.add_user_task(run_data) as u64;
+                    if !validate_run(run_data) {
+                        frame.x[0] = u64::MAX;
+                        return;
+                    }
+
+                    if !scheduler.spawn_foreground_user(run_data, frame) {
+                        frame.x[0] = u64::MAX;
+                    }
+
+                    return;
                 }
                 return;
             }
@@ -2528,6 +2812,31 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     }
                 }
 
+                return;
+            }
+            15 => {
+                let filesystem_ptr = &raw mut FILESYSTEM_PTR;
+                unsafe {
+                    let filesystem = match (*filesystem_ptr).as_mut() {
+                        Some(filesystem) => filesystem,
+                        None => {
+                            frame.x[0] = u64::MAX;
+                            return;
+                        }
+                    };
+
+                    match filesystem.disk_usage() {
+                        Ok((total_blocks, used_blocks, free_blocks, block_size)) => {
+                            frame.x[0] = total_blocks;
+                            frame.x[1] = used_blocks;
+                            frame.x[2] = free_blocks;
+                            frame.x[3] = block_size;
+                        }
+                        Err(()) => {
+                            frame.x[0] = u64::MAX;
+                        }
+                    }
+                }
                 return;
             }
             42 => {
@@ -2691,6 +3000,54 @@ pub extern "C" fn rust_start() -> ! {
     enable_mmu();
 
     writeln!(uart, "MMU enabled!").unwrap();
+    writeln!(uart, "Scanning VirtIO MMIO devices...").unwrap();
+
+    for base in (0x0A00_0000usize..=0x0A00_3E00).step_by(0x200) {
+        unsafe {
+            let magic = core::ptr::read_volatile(base as *const u32);
+            let version = core::ptr::read_volatile((base + 4) as *const u32);
+            let device_id = core::ptr::read_volatile((base + 8) as *const u32);
+
+            if magic == 0x7472_6976 && device_id != 0 {
+                writeln!(
+                    uart,
+                    "VirtIO at {:#x}: version={}, device={}",
+                    base,
+                    version,
+                    device_id
+                ).unwrap();
+            }
+        }
+    }
+    writeln!(uart, "Initialising VirtIO GPU...").unwrap();
+
+    let gpu = VirtioGpu::new();
+    let (magic, version, device_id) = gpu.probe();
+
+    writeln!(
+        uart,
+        "GPU: magic={:#x} version={} device={}",
+        magic,
+        version,
+        device_id
+    ).unwrap();
+
+    match gpu.init() {
+        Ok(()) => {
+            writeln!(uart, "VirtIO GPU initialised!").unwrap();
+        }
+        Err(error) => {
+            writeln!(uart, "VirtIO GPU init failed: {:?}", error).unwrap();
+        }
+    }
+    match gpu.get_display_info() {
+        Ok((width, height)) => {
+            writeln!(uart, "GPU display: {}x{}", width, height).unwrap();
+        }
+        Err(error) => {
+            writeln!(uart, "GPU display query failed: {:?}", error).unwrap();
+        }
+    }
     writeln!(uart, "Initialising virtio block device...").unwrap();
 
     let disk = VirtioBlk::new();
@@ -2829,10 +3186,6 @@ pub extern "C" fn rust_start() -> ! {
         (*scheduler) = Some(Scheduler::new());
         if let Some(scheduler) = (*scheduler).as_mut() {
             scheduler.add_task(idle_task);
-            //scheduler.add_task(task_a);
-            //scheduler.add_task(task_b);
-            //scheduler.add_task(task_c);
-            //scheduler.add_user_task(user_test);
             scheduler.add_user_task(runData);
         }
     }

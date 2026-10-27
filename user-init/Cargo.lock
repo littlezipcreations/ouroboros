@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "ouroboros-system"
+version = "0.1.0"
+
+[[package]]
 name = "user-init"
 version = "0.1.0"
+dependencies = [
+ "ouroboros-system",
+]
