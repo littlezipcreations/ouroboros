@@ -2,46 +2,20 @@
 #![no_main]
 
 use ouroboros_system::syscall;
-use ouroboros_system::console;
+use ouroboros_system::print;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
-fn write_number(mut value: u64) {
-    let mut buffer = [0u8; 20];
-    let mut cursor = buffer.len();
-
-    if value == 0 {
-        syscall::sys_write(b"0");
-        return;
-    }
-
-    while value != 0 {
-        cursor -= 1;
-        buffer[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-
-    syscall::sys_write(&buffer[cursor..]);
+fn write_number(value: u64) {
+    let _ = print!("{}", value);
 }
 
 fn write_hex_byte(value: u8) {
-    const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let low = TABLE[(value & 0x0f) as usize];
-    let high = TABLE[((value >> 4) & 0x0f) as usize];
-    syscall::sys_write(&[high, low]);
+    let _ = print!("{:02x}", value);
 }
 
-fn write_hex_u64(mut value: u64) {
-    let mut buffer = [0u8; 16];
-    let mut index = buffer.len();
-
-    while index > 0 {
-        index -= 1;
-        buffer[index] = b"0123456789abcdef"[(value & 0xf) as usize];
-        value >>= 4;
-    }
-
-    syscall::sys_write(&buffer);
+fn write_hex_u64(value: u64) {
+    let _ = print!("{:016x}", value);
 }
 
 fn strip_spaces(bytes: &[u8]) -> &[u8] {
@@ -144,13 +118,13 @@ fn read_line(buffer: &mut [u8]) -> usize {
 
         match byte {
             b'\r' | b'\n' => {
-                syscall::sys_write(b"\r\n");
+                let _ = print!("\r\n");
                 return length;
             }
             8 | 127 => {
                 if length > 0 {
                     length -= 1;
-                    syscall::sys_write(b"\x08 \x08");
+                    let _ = print!("\x08 \x08");
                 }
             }
             0x20..=0x7e => {
@@ -167,7 +141,7 @@ fn read_line(buffer: &mut [u8]) -> usize {
 
 fn print_hex_dump(bytes: &[u8]) {
     if bytes.is_empty() {
-        syscall::sys_write(b"(empty)\r\n");
+        let _ = print!("(empty)\r\n");
         return;
     }
 
@@ -175,29 +149,30 @@ fn print_hex_dump(bytes: &[u8]) {
         let line = &bytes[offset..bytes.len().min(offset + 16)];
 
         write_hex_u64(offset as u64);
-        syscall::sys_write(b": ");
+        let _ = print!(": ");
 
         for (index, byte) in line.iter().enumerate() {
             if index == 8 {
-                syscall::sys_write(b" ");
+                let _ = print!(" ");
             }
             write_hex_byte(*byte);
-            syscall::sys_write(b" ");
+            let _ = print!(" ");
         }
 
         for _ in 0..(16 - line.len()) {
-            syscall::sys_write(b"   ");
+            let _ = print!("   ");
         }
         if line.len() <= 8 {
-            syscall::sys_write(b" ");
+            let _ = print!(" ");
         }
 
-        syscall::sys_write(b"|");
+        let _ = print!("|");
         for byte in line {
             let printable = *byte >= 0x20 && *byte <= 0x7e;
-            syscall::sys_write(&[if printable { *byte } else { b'.' }]);
+            let character = if printable { *byte as char } else { '.' };
+            let _ = print!("{}", character);
         }
-        syscall::sys_write(b"|\r\n");
+        let _ = print!("|\r\n");
     }
 }
 
@@ -208,20 +183,20 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
     };
 
     if text_length > 0 {
-        syscall::sys_write(b"Current contents:\r\n");
+        let _ = print!("Current contents:\r\n");
         syscall::sys_write(&scratch[..text_length]);
         if !scratch[..text_length].ends_with(b"\n") {
-            syscall::sys_write(b"\r\n");
+            let _ = print!("\r\n");
         }
-        syscall::sys_write(b"--- end of file ---\r\n");
+        let _ = print!("--- end of file ---\r\n");
     } else {
-        syscall::sys_write(b"New file (empty)\r\n");
+        let _ = print!("New file (empty)\r\n");
     }
 
     let mut line = [0u8; 128];
 
     loop {
-        syscall::sys_write(b"edit> ");
+        let _ = print!("edit> ");
         let line_length = read_line(&mut line);
         let command = strip_spaces(&line[..line_length]);
 
@@ -230,25 +205,23 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 scratch[text_length] = b'\n';
                 text_length += 1;
             } else {
-                syscall::sys_write(b"edit: buffer full\r\n");
+                let _ = print!("edit: buffer full\r\n");
             }
             continue;
         }
 
         match command {
             b":help" => {
-                syscall::sys_write(
-                    b"Command summary: :view, :replace N text, :w save, :q quit, :wq save+quit\r\n"
-                );
+                let _ = print!("Command summary: :view, :replace N text, :w save, :q quit, :wq save+quit\r\n");
             }
             b":view" | b":list" => {
                 if text_length > 0 {
                     syscall::sys_write(&scratch[..text_length]);
                     if !scratch[..text_length].ends_with(b"\n") {
-                        syscall::sys_write(b"\r\n");
+                        let _ = print!("\r\n");
                     }
                 } else {
-                    syscall::sys_write(b"(empty)\r\n");
+                    let _ = print!("(empty)\r\n");
                 }
             }
             _ if command.starts_with(b":replace ") => {
@@ -256,7 +229,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let separator = match rest.iter().position(|&byte| byte == b' ') {
                     Some(index) => index,
                     None => {
-                        syscall::sys_write(b"Usage: :replace N text\r\n");
+                        let _ = print!("Usage: :replace N text\r\n");
                         continue;
                     }
                 };
@@ -264,7 +237,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let line_number = match parse_usize(&rest[..separator]) {
                     Some(value) => value,
                     None => {
-                        syscall::sys_write(b"replace: line number must be numeric\r\n");
+                        let _ = print!("replace: line number must be numeric\r\n");
                         continue;
                     }
                 };
@@ -272,9 +245,9 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let new_text = strip_spaces(&rest[separator + 1..]);
 
                 if replace_line(scratch, &mut text_length, line_number, new_text) {
-                    syscall::sys_write(b"Line updated.\r\n");
+                    let _ = print!("Line updated.\r\n");
                 } else {
-                    syscall::sys_write(b"replace: bad line number or buffer too small\r\n");
+                    let _ = print!("replace: bad line number or buffer too small\r\n");
                 }
             }
             _ if command.starts_with(b":edit ") => {
@@ -282,7 +255,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let separator = match rest.iter().position(|&byte| byte == b' ') {
                     Some(index) => index,
                     None => {
-                        syscall::sys_write(b"Usage: :edit N text\r\n");
+                        let _ = print!("Usage: :edit N text\r\n");
                         continue;
                     }
                 };
@@ -290,7 +263,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let line_number = match parse_usize(&rest[..separator]) {
                     Some(value) => value,
                     None => {
-                        syscall::sys_write(b"edit: line number must be numeric\r\n");
+                        let _ = print!("edit: line number must be numeric\r\n");
                         continue;
                     }
                 };
@@ -298,47 +271,47 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 let new_text = strip_spaces(&rest[separator + 1..]);
 
                 if replace_line(scratch, &mut text_length, line_number, new_text) {
-                    syscall::sys_write(b"Line updated.\r\n");
+                    let _ = print!("Line updated.\r\n");
                 } else {
-                    syscall::sys_write(b"edit: bad line number or buffer too small\r\n");
+                    let _ = print!("edit: bad line number or buffer too small\r\n");
                 }
             }
             b":w" | b":write" => {
                 match syscall::write_file(path, &scratch[..text_length]) {
                     Some(count) => {
-                        syscall::sys_write(b"Saved ");
+                        let _ = print!("Saved ");
                         write_number(count as u64);
-                        syscall::sys_write(b" bytes to ");
+                        let _ = print!(" bytes to ");
                         syscall::sys_write(path);
-                        syscall::sys_write(b"\r\n");
+                        let _ = print!("\r\n");
                     }
                     None => {
-                        syscall::sys_write(b"edit: save failed\r\n");
+                        let _ = print!("edit: save failed\r\n");
                     }
                 }
             }
             b":q" | b":quit" => {
-                syscall::sys_write(b"Edit cancelled.\r\n");
+                let _ = print!("Edit cancelled.\r\n");
                 return false;
             }
             b":wq" | b":writequit" => {
                 match syscall::write_file(path, &scratch[..text_length]) {
                     Some(count) => {
-                        syscall::sys_write(b"Saved ");
+                        let _ = print!("Saved ");
                         write_number(count as u64);
-                        syscall::sys_write(b" bytes to ");
+                        let _ = print!(" bytes to ");
                         syscall::sys_write(path);
-                        syscall::sys_write(b"\r\n");
+                        let _ = print!("\r\n");
                         return true;
                     }
                     None => {
-                        syscall::sys_write(b"edit: save failed\r\n");
+                        let _ = print!("edit: save failed\r\n");
                     }
                 }
             }
             _ => {
                 if text_length + command.len() + 1 > scratch.len() {
-                    syscall::sys_write(b"edit: buffer full\r\n");
+                    let _ = print!("edit: buffer full\r\n");
                     continue;
                 }
 
@@ -352,7 +325,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
 }
 
 fn shell() -> ! {
-    console::write_line("Welcome to Ouroboros!");
+    let _ = print!("Welcome to Ouroboros!\r\n");
     const FILE_BUFFER_PAGES: usize = 12;
     const FILE_BUFFER_SIZE: usize = FILE_BUFFER_PAGES * 4096;
 
@@ -361,16 +334,14 @@ fn shell() -> ! {
     let file_buffer = syscall::alloc_pages(FILE_BUFFER_PAGES);
 
     if file_buffer.is_none() {
-        syscall::sys_write(
-            b"Warning: filesystem buffer allocation failed.\r\n"
-        );
+        let _ = print!("Warning: filesystem buffer allocation failed.\r\n");
     }
 
     let mut line = [0u8; 128];
     let mut ignore_next_lf = false;
 
     loop {
-        syscall::sys_write(b"ouro> ");
+        let _ = print!("ouro> ");
         let mut length = 0;
 
         // Collect one line of input.
@@ -394,19 +365,19 @@ fn shell() -> ! {
             match byte {
                 b'\r' => {
                     ignore_next_lf = true;
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                     break;
                 }
 
                 b'\n' => {
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                     break;
                 }
 
                 8 | 127 => {
                     if length > 0 {
                         length -= 1;
-                        syscall::sys_write(b"\x08 \x08");
+                        let _ = print!("\x08 \x08");
                     }
                 }
 
@@ -432,11 +403,9 @@ fn shell() -> ! {
         // help
         // ----------------------------------------------------
         if command == b"help" {
-            syscall::sys_write(
-                b"Commands: help, stat, cat, ls, df, touch, write,\r\n\
+            let _ = print!("Commands: help, stat, cat, ls, df, touch, write,\r\n\
                   \x20         rm, mkdir, rmdir, run, edit, hex\r\n\
-                  Paths must be absolute.\r\n"
-            );
+                  Paths must be absolute.\r\n");
         }
 
         // ----------------------------------------------------
@@ -446,7 +415,7 @@ fn shell() -> ! {
             let usage = match syscall::disk_usage() {
                 Some(usage) => usage,
                 None => {
-                    syscall::sys_write(b"df: filesystem query failed\r\n");
+                    let _ = print!("df: filesystem query failed\r\n");
                     continue;
                 }
             };
@@ -460,16 +429,16 @@ fn shell() -> ! {
                 (used_kib * 100) / total_kib
             };
 
-            syscall::sys_write(b"Filesystem     1K-blocks  Used Available Use% Mounted on\r\n");
-            syscall::sys_write(b"rootfs         ");
+            let _ = print!("Filesystem     1K-blocks  Used Available Use% Mounted on\r\n");
+            let _ = print!("rootfs         ");
             write_number(total_kib);
-            syscall::sys_write(b"  ");
+            let _ = print!("  ");
             write_number(used_kib);
-            syscall::sys_write(b"  ");
+            let _ = print!("  ");
             write_number(available_kib);
-            syscall::sys_write(b"  ");
+            let _ = print!("  ");
             write_number(used_percent);
-            syscall::sys_write(b"% /\r\n");
+            let _ = print!("% /\r\n");
         }
 
         // ----------------------------------------------------
@@ -479,7 +448,7 @@ fn shell() -> ! {
             let path = strip_spaces(&command[4..]);
 
             if path.is_empty() {
-                syscall::sys_write(b"Usage: hex /path\r\n");
+                let _ = print!("Usage: hex /path\r\n");
                 continue;
             }
 
@@ -488,7 +457,7 @@ fn shell() -> ! {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
                 None => {
-                    syscall::sys_write(b"hex: buffer allocation failed\r\n");
+                    let _ = print!("hex: buffer allocation failed\r\n");
                     continue;
                 }
             };
@@ -498,7 +467,7 @@ fn shell() -> ! {
                     print_hex_dump(&buffer[..count]);
                 }
                 None => {
-                    syscall::sys_write(b"hex: read failed\r\n");
+                    let _ = print!("hex: read failed\r\n");
                 }
             }
         }
@@ -510,7 +479,7 @@ fn shell() -> ! {
             let path = strip_spaces(&command[5..]);
 
             if path.is_empty() {
-                syscall::sys_write(b"Usage: edit /path\r\n");
+                let _ = print!("Usage: edit /path\r\n");
                 continue;
             }
 
@@ -519,7 +488,7 @@ fn shell() -> ! {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
                 None => {
-                    syscall::sys_write(b"edit: buffer allocation failed\r\n");
+                    let _ = print!("edit: buffer allocation failed\r\n");
                     continue;
                 }
             };
@@ -535,31 +504,29 @@ fn shell() -> ! {
 
             match syscall::stat(path) {
                 Some(info) => {
-                    syscall::sys_write(b"inode: ");
+                    let _ = print!("inode: ");
                     write_number(info.inode);
 
-                    syscall::sys_write(b"\r\nsize: ");
+                    let _ = print!("\r\nsize: ");
                     write_number(info.size);
 
-                    syscall::sys_write(b"\r\ntype: ");
+                    let _ = print!("\r\ntype: ");
 
                     if info.kind == syscall::FILE_KIND_FILE {
-                        syscall::sys_write(b"file");
+                        let _ = print!("file");
                     } else if info.kind == syscall::FILE_KIND_DIRECTORY {
-                        syscall::sys_write(b"directory");
+                        let _ = print!("directory");
                     } else {
-                        syscall::sys_write(b"unknown");
+                        let _ = print!("unknown");
                     }
 
-                    syscall::sys_write(b"\r\nlinks: ");
+                    let _ = print!("\r\nlinks: ");
                     write_number(info.links);
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                 }
 
                 None => {
-                    syscall::sys_write(
-                        b"stat: operation failed\r\n"
-                    );
+                    let _ = print!("stat: operation failed\r\n");
                 }
             }
         }
@@ -573,9 +540,7 @@ fn shell() -> ! {
             let buffer_ptr = match file_buffer {
                 Some(ptr) => ptr,
                 None => {
-                    syscall::sys_write(
-                        b"cat: no filesystem buffer\r\n"
-                    );
+                    let _ = print!("cat: no filesystem buffer\r\n");
                     continue;
                 }
             };
@@ -593,18 +558,16 @@ fn shell() -> ! {
                         syscall::sys_write(&output[..count]);
 
                         if output[count - 1] != b'\n' {
-                            syscall::sys_write(b"\r\n");
+                            let _ = print!("\r\n");
                         }
                     } else {
-                        syscall::sys_write(b"\r\n");
+                        let _ = print!("\r\n");
                     }
                 }
 
                 None => {
-                    syscall::sys_write(
-                        b"cat: read failed; file may be missing \
-                          or too large\r\n"
-                    );
+                    let _ = print!("cat: read failed; file may be missing \
+                          or too large\r\n");
                 }
             }
         }
@@ -618,9 +581,7 @@ fn shell() -> ! {
             let buffer_ptr = match file_buffer {
                 Some(ptr) => ptr,
                 None => {
-                    syscall::sys_write(
-                        b"touch: no filesystem buffer\r\n"
-                    );
+                    let _ = print!("touch: no filesystem buffer\r\n");
                     continue;
                 }
             };
@@ -633,15 +594,13 @@ fn shell() -> ! {
 
             match syscall::create_file(path, empty_data) {
                 Some(inode) => {
-                    syscall::sys_write(b"Created inode ");
+                    let _ = print!("Created inode ");
                     write_number(inode as u64);
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                 }
 
                 None => {
-                    syscall::sys_write(
-                        b"touch: create failed; path may exist\r\n"
-                    );
+                    let _ = print!("touch: create failed; path may exist\r\n");
                 }
             }
         }
@@ -660,23 +619,19 @@ fn shell() -> ! {
 
                     match syscall::write_file(path, contents) {
                         Some(count) => {
-                            syscall::sys_write(b"Wrote ");
+                            let _ = print!("Wrote ");
                             write_number(count as u64);
-                            syscall::sys_write(b" bytes\r\n");
+                            let _ = print!(" bytes\r\n");
                         }
 
                         None => {
-                            syscall::sys_write(
-                                b"write: operation failed\r\n"
-                            );
+                            let _ = print!("write: operation failed\r\n");
                         }
                     }
                 }
 
                 _ => {
-                    syscall::sys_write(
-                        b"Usage: write /path contents\r\n"
-                    );
+                    let _ = print!("Usage: write /path contents\r\n");
                 }
             }
         }
@@ -688,11 +643,9 @@ fn shell() -> ! {
             let path = &command[3..];
 
             if syscall::delete_file(path) {
-                syscall::sys_write(b"File deleted.\r\n");
+                let _ = print!("File deleted.\r\n");
             } else {
-                syscall::sys_write(
-                    b"rm: deletion failed\r\n"
-                );
+                let _ = print!("rm: deletion failed\r\n");
             }
         }
 
@@ -704,15 +657,13 @@ fn shell() -> ! {
 
             match syscall::create_dir(path) {
                 Some(inode) => {
-                    syscall::sys_write(b"Created directory inode ");
+                    let _ = print!("Created directory inode ");
                     write_number(inode as u64);
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                 }
 
                 None => {
-                    syscall::sys_write(
-                        b"mkdir: operation failed\r\n"
-                    );
+                    let _ = print!("mkdir: operation failed\r\n");
                 }
             }
         }
@@ -724,11 +675,9 @@ fn shell() -> ! {
             let path = &command[6..];
 
             if syscall::remove_dir(path) {
-                syscall::sys_write(b"Directory removed.\r\n");
+                let _ = print!("Directory removed.\r\n");
             } else {
-                syscall::sys_write(
-                    b"rmdir: removal failed; directory may not be empty\r\n"
-                );
+                let _ = print!("rmdir: removal failed; directory may not be empty\r\n");
             }
         }
 
@@ -737,18 +686,16 @@ fn shell() -> ! {
         // ----------------------------------------------------
         else if command.starts_with(b"run ") {
             let path = &command[4..];
-            if path == b"/bin/user-init.run"{syscall::sys_write(b"You should NOT be trying to open a nested shell.\r\n"); continue;}
+            if path == b"/bin/user-init.run"{let _ = print!("You should NOT be trying to open a nested shell.\r\n"); continue;}
             match syscall::spawn(path) {
                 Some(task_id) => {
-                    syscall::sys_write(b"Completed task ");
+                    let _ = print!("Completed task ");
                     write_number(task_id as u64);
-                    syscall::sys_write(b"\r\n");
+                    let _ = print!("\r\n");
                 }
 
                 None => {
-                    syscall::sys_write(
-                        b"run: executable could not be started\r\n"
-                    );
+                    let _ = print!("run: executable could not be started\r\n");
                 }
             }
         }
@@ -780,7 +727,7 @@ fn shell() -> ! {
                     core::slice::from_raw_parts_mut(ptr, 12 * 4096)
                 },
                 None => {
-                    syscall::sys_write(b"ls: file buffer allocation failed\n");
+                    let _ = print!("ls: file buffer allocation failed\n");
                     continue;
                 }
             };
@@ -790,9 +737,7 @@ fn shell() -> ! {
                     syscall::sys_write(&buffer[..count]);
                 }
                 None => {
-                    syscall::sys_write(
-                        b"ls: cannot list directory (missing path or buffer too small)\n"
-                    );
+                    let _ = print!("ls: cannot list directory (missing path or buffer too small)\n");
                 }
             }
         }
@@ -800,9 +745,9 @@ fn shell() -> ! {
         // Unknown command
         // ----------------------------------------------------
         else {
-            syscall::sys_write(b"Unknown command: ");
+            let _ = print!("Unknown command: ");
             syscall::sys_write(command);
-            syscall::sys_write(b"\r\n");
+            let _ = print!("\r\n");
         }
     }
 }

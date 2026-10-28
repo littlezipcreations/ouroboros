@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![warn(non_snake_case)]
 
 #[path = "../syscall.rs"]
 use ouroboros_system::syscall;

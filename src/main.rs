@@ -225,105 +225,131 @@ fn run_read_u64(data: &[u8], offset: usize) -> u64 {
 fn run_align_up(value: usize) -> usize {
     (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
-fn validate_run(data: &[u8]) -> bool {
-    if data.len() < RUN_HEADER_SIZE || &data[0..4] != RUN_MAGIC {
-        return false;
-    }
+fn validate_run(data: &[u8]) -> Result<(), RunValidationError> {
+	if data.len() < RUN_HEADER_SIZE {
+		return Err(RunValidationError::TooSmall);
+	}
 
-    if run_read_u16(data, 4) != RUN_VERSION
-        || run_read_u16(data, 6) != RUN_ARCH_AARCH64
-        || run_read_u16(data, 8) as usize != RUN_HEADER_SIZE
-    {
-        return false;
-    }
+	if &data[0..4] != RUN_MAGIC {
+		return Err(RunValidationError::InvalidMagic);
+	}
 
-    let segmentCount = run_read_u16(data, 10) as usize;
-    let entry = run_read_u64(data, 12);
-    let imageSize = run_read_u64(data, 24);
+	if run_read_u16(data, 4) != RUN_VERSION {
+		return Err(RunValidationError::UnsupportedVersion);
+	}
 
-    if segmentCount == 0
-        || segmentCount > RUN_MAX_SEGMENTS
-        || imageSize != data.len() as u64
-        || entry < VMAP_START as u64
-        || entry >= VMAP_END as u64
-    {
-        return false;
-    }
+	if run_read_u16(data, 6) != RUN_ARCH_AARCH64 {
+		return Err(RunValidationError::UnsupportedArchitecture);
+	}
 
-    let tableEnd = match RUN_HEADER_SIZE
-        .checked_add(segmentCount * RUN_SEGMENT_SIZE)
-    {
-        Some(end) => end,
-        None => return false,
-    };
+	if run_read_u16(data, 8) as usize != RUN_HEADER_SIZE {
+		return Err(RunValidationError::InvalidHeaderSize);
+	}
 
-    if tableEnd > data.len() {
-        return false;
-    }
+	let segmentCount = run_read_u16(data, 10) as usize;
+	let entry = run_read_u64(data, 12);
+	let imageSize = run_read_u64(data, 24);
 
-    let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
-    let mut maxEnd = VMAP_START;
-    let mut entryIsExecutable = false;
+	if segmentCount == 0 || segmentCount > RUN_MAX_SEGMENTS {
+		return Err(RunValidationError::InvalidSegmentCount);
+	}
 
-    for i in 0..segmentCount {
-        let base = RUN_HEADER_SIZE + i * RUN_SEGMENT_SIZE;
+	if imageSize != data.len() as u64 {
+		return Err(RunValidationError::ImageSizeMismatch);
+	}
 
-        let virtualAddress = run_read_u64(data, base) as usize;
-        let fileOffset = run_read_u64(data, base + 8) as usize;
-        let fileSize = run_read_u64(data, base + 16) as usize;
-        let memorySize = run_read_u64(data, base + 24) as usize;
-        let flags = run_read_u32(data, base + 32);
+	if entry < VMAP_START as u64 || entry >= VMAP_END as u64 {
+		return Err(RunValidationError::EntryOutOfRange);
+	}
 
-        if memorySize == 0
-            || fileSize > memorySize
-            || virtualAddress % PAGE_SIZE != 0
-        {
-            return false;
-        }
+	let tableSize = segmentCount
+		.checked_mul(RUN_SEGMENT_SIZE)
+		.ok_or(RunValidationError::SegmentTableOverflow)?;
 
-        let segmentEnd = match virtualAddress.checked_add(memorySize) {
-            Some(end) => end,
-            None => return false,
-        };
+	let tableEnd = RUN_HEADER_SIZE
+		.checked_add(tableSize)
+		.ok_or(RunValidationError::SegmentTableOverflow)?;
 
-        if virtualAddress < VMAP_START || segmentEnd > VMAP_END {
-            return false;
-        }
+	if tableEnd > data.len() {
+		return Err(RunValidationError::SegmentTableOutOfBounds);
+	}
 
-        let fileEnd = match fileOffset.checked_add(fileSize) {
-            Some(end) => end,
-            None => return false,
-        };
+	let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
+	let mut maxEnd = VMAP_START;
+	let mut entryIsExecutable = false;
 
-        if fileEnd > data.len() {
-            return false;
-        }
+	for i in 0..segmentCount {
+		let base = RUN_HEADER_SIZE + i * RUN_SEGMENT_SIZE;
 
-        for j in 0..i {
-            let (otherStart, otherEnd) = ranges[j];
+		let virtualAddress = run_read_u64(data, base) as usize;
+		let fileOffset = run_read_u64(data, base + 8) as usize;
+		let fileSize = run_read_u64(data, base + 16) as usize;
+		let memorySize = run_read_u64(data, base + 24) as usize;
+		let flags = run_read_u32(data, base + 32);
 
-            if !(segmentEnd <= otherStart || virtualAddress >= otherEnd) {
-                return false;
-            }
-        }
+		if memorySize == 0 {
+			return Err(RunValidationError::EmptySegment);
+		}
 
-        ranges[i] = (virtualAddress, segmentEnd);
-        maxEnd = maxEnd.max(segmentEnd);
+		if fileSize > memorySize {
+			return Err(RunValidationError::FileLargerThanMemory);
+		}
 
-        if (flags & RUN_X) != 0
-            && entry >= virtualAddress as u64
-            && entry < segmentEnd as u64
-        {
-            entryIsExecutable = true;
-        }
-    }
+		if virtualAddress % PAGE_SIZE != 0 {
+			return Err(RunValidationError::UnalignedSegment);
+		}
 
-    if !entryIsExecutable {
-        return false;
-    }
+		let segmentEnd = virtualAddress
+			.checked_add(memorySize)
+			.ok_or(RunValidationError::SegmentAddressOverflow)?;
 
-    let heapStart = run_align_up(maxEnd.max(USER_HEAP_START));
-    heapStart < USER_HEAP_END
+		if virtualAddress < VMAP_START || segmentEnd > VMAP_END {
+			return Err(RunValidationError::SegmentOutOfRange);
+		}
+
+		let fileEnd = fileOffset
+			.checked_add(fileSize)
+			.ok_or(RunValidationError::FileRangeOverflow)?;
+
+		if fileEnd > data.len() {
+			return Err(RunValidationError::FileRangeOutOfBounds);
+		}
+
+		for j in 0..i {
+			let (otherStart, otherEnd) = ranges[j];
+
+			if !(segmentEnd <= otherStart || virtualAddress >= otherEnd) {
+				return Err(RunValidationError::OverlappingSegments);
+			}
+		}
+
+		ranges[i] = (virtualAddress, segmentEnd);
+		maxEnd = maxEnd.max(segmentEnd);
+
+		if (flags & RUN_X) != 0
+			&& entry >= virtualAddress as u64
+			&& entry < segmentEnd as u64
+		{
+			entryIsExecutable = true;
+		}
+	}
+
+	if !entryIsExecutable {
+		return Err(RunValidationError::EntryNotExecutable);
+	}
+
+	let heapBase = maxEnd.max(USER_HEAP_START);
+
+	let heapStart = heapBase
+		.checked_add(PAGE_SIZE - 1)
+		.ok_or(RunValidationError::HeapAlignmentOverflow)?
+		& !(PAGE_SIZE - 1);
+
+	if heapStart >= USER_HEAP_END {
+		return Err(RunValidationError::NoHeapSpace);
+	}
+
+	Ok(())
 }
 fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
     assert!(data.len() >= RUN_HEADER_SIZE, ".run header too small");
@@ -445,7 +471,30 @@ fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
 
     (entry, heap_start)
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunValidationError {
+	TooSmall,
+	InvalidMagic,
+	UnsupportedVersion,
+	UnsupportedArchitecture,
+	InvalidHeaderSize,
+	InvalidSegmentCount,
+	ImageSizeMismatch,
+	EntryOutOfRange,
+	SegmentTableOverflow,
+	SegmentTableOutOfBounds,
+	EmptySegment,
+	FileLargerThanMemory,
+	UnalignedSegment,
+	SegmentAddressOverflow,
+	SegmentOutOfRange,
+	FileRangeOverflow,
+	FileRangeOutOfBounds,
+	OverlappingSegments,
+	EntryNotExecutable,
+	HeapAlignmentOverflow,
+	NoHeapSpace,
+}
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -1357,7 +1406,6 @@ impl Scheduler {
         };
         self.switch_to_task(next, frame);
     }
-    
     fn exit_current(&mut self, frame: &mut ExceptionFrame) {
         if self.tasks.count == 0 {
             panic!("No tasks");
@@ -1423,7 +1471,6 @@ impl Scheduler {
 
         self.switch_to_task(0, frame);
     }
-
     fn switch_to_task(
         &mut self,
         id: usize,
@@ -1787,7 +1834,6 @@ unsafe fn unmap_page(address_space: &mut AddressSpace, virt_addr: usize) {
     assert!(address_space.l3_vmap.entries[index].is_valid());
     address_space.l3_vmap.entries[index] = PageTableEntry::invalid();
 }
-
 fn reclaim_user_pages(addressSpaceId: usize) {
     unsafe{
         if addressSpaceId >= MAX_TASKS {
@@ -2746,7 +2792,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                         run_size,
                     );
 
-                    if !validate_run(run_data) {
+                    if let Err(error) = validate_run(run_data) {
                         frame.x[0] = u64::MAX;
                         return;
                     }

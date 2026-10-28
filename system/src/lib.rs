@@ -1,5 +1,4 @@
 #![no_std]
-use core::fmt;
 
 pub mod syscall;
 
@@ -51,7 +50,8 @@ pub enum Error {
 
 /// A result returned by the Ouroboros userspace library.
 pub type Result<T> = core::result::Result<T, Error>;
-mod console {
+pub mod console {
+    use core::fmt;
     use crate::{Error, Result};
 
     /// Writes all bytes of a string to the system console.
@@ -92,7 +92,7 @@ mod console {
 #[macro_export]
 macro_rules! print{ //Thank you Google. I'll be damned if anyone can write a macro off the top of their head.
     ($($arg:tt)*) => {
-        $crate::console::write_fmt(core::format_arges!($($arg)*))
+        $crate::console::write_fmt(core::format_args!($($arg)*))
     };
 }
 #[macro_export]
