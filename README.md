@@ -1,5 +1,8 @@
-This, as you might have guessed, is a README of the Ouroboros operating.
+This, as you might have guessed, is a README of the Ouroboros operating system.
 I will first explain how this kernel is run on my system (or if you are savvy-enough, on any system). Then will follow a breakdown of the kernel, and then design paradigms and aspirations.
+
+Fair warning - I am, as of yet, the only person contributing to this pet project, and as such, the READMEs may be slightly out of date at any moment.
+If you notice this, you can either contact me, or fix it yourself.
 
 ## How to run Ouroboros (my way)
 Ouroboros is designed for Arm Cortex CPUs, with the Arm Cortex-A76 the focus (although it runs on any such CPU at least as early as the Arm Cortex-A53 being the earliest I have tested). I do not plan to support x86-64 CPUs, RISC V CPUs or any other aarch64 CPUs.

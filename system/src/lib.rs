@@ -1,4 +1,5 @@
 #![no_std]
+use core::fmt;
 
 pub mod syscall;
 
@@ -50,7 +51,7 @@ pub enum Error {
 
 /// A result returned by the Ouroboros userspace library.
 pub type Result<T> = core::result::Result<T, Error>;
-pub mod console {
+mod console {
     use crate::{Error, Result};
 
     /// Writes all bytes of a string to the system console.
@@ -76,4 +77,30 @@ pub mod console {
         write(text)?;
         write("\n")
     }
+    struct ConsoleWriter;
+    impl fmt::Write for ConsoleWriter{
+        fn write_str(&mut self, text: &str) -> fmt::Result{
+            write(text).map_err(|_| fmt::Error)
+        }
+    }
+    pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<()>{
+        fmt::write(&mut ConsoleWriter, args).map_err(|_| Error::Unknown)
+    }
+
+}
+
+#[macro_export]
+macro_rules! print{ //Thank you Google. I'll be damned if anyone can write a macro off the top of their head.
+    ($($arg:tt)*) => {
+        $crate::console::write_fmt(core::format_arges!($($arg)*))
+    };
+}
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::console::write_fmt(core::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::console::write_fmt(core::format_args!("{}\n", core::format_args!($($arg)*)))
+    };
 }

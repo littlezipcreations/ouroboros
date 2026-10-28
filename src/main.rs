@@ -2148,7 +2148,7 @@ unsafe fn switch_address_space(id: usize) {
     );
 }
 fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
-    if pages == 0 {
+    if address_space_id >= MAX_TASKS || pages == 0 {
         return None;
     }
 
@@ -2212,6 +2212,34 @@ fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
     }
 
     Some(start)
+}
+fn validate_user_range(addr_space_id: usize, ptr: usize, len: usize, write: bool) -> bool{
+    if addr_space_id >= MAX_TASKS || ptr < VMAP_START {return false;}
+    let end = match ptr.checked_add(len){
+        Some(end) => end,
+        None => return false,
+    };
+    if end > VMAP_END{return false;}
+    if len == 0{return true;}
+
+    let first_page = ptr & !(PAGE_SIZE - 1);
+    let last_page = (end - 1) & !(PAGE_SIZE - 1);
+    let addr_spaces = core::ptr::addr_of!(ADDRESS_SPACES);
+    let mut page = first_page;
+
+    loop{
+        let index = (page >> 12) & 0x1FF;
+        let entry = unsafe {
+            (*addr_spaces)[addr_space_id].l3_vmap.entries[index]
+        };
+        if !entry.is_valid(){return false;}
+        let ap = (entry.0 >> 6) & 0b11;
+        if ap != 0b01 && ap != 0b11{return false;}
+        if write && ap != 0b01{return false;}
+        if page == last_page{break;}
+        page += PAGE_SIZE;
+    }
+    true
 }
 // ============================================================
 // Exception decoding
@@ -2312,7 +2340,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                         return;
                     }
                 };
-                if ptr < VMAP_START || end > VMAP_END {
+                if !validate_user_range(unsafe{CURRENT_ASID}, ptr, len, false) {
                     frame.x[0] = (-1i64) as u64;
                     return;
                 }
@@ -2374,6 +2402,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let addr_space_id = unsafe{CURRENT_ASID};
+                if !validate_user_range(addr_space_id, path_ptr, path_len, false
+                || !validate_user_range(addr_space_id, data_ptr, data_len, false)){
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
 
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
                 let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
@@ -2411,6 +2445,14 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     }
                 };
                 if path_ptr < VMAP_START || path_end > VMAP_END || buffer_ptr < VMAP_START || buffer_end > VMAP_END {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+                let address_space_id = unsafe { CURRENT_ASID };
+
+                if !validate_user_range(address_space_id, path_ptr, path_len, false)
+                    || !validate_user_range(address_space_id, buffer_ptr, buffer_len, true)
+                {
                     frame.x[0] = u64::MAX;
                     return;
                 }
@@ -2454,6 +2496,14 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let address_space_id = unsafe { CURRENT_ASID };
+
+                if !validate_user_range(address_space_id, path_ptr, path_len, false)
+                    || !validate_user_range(address_space_id, data_ptr, data_len, false)
+                {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
 
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
                 let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
@@ -2484,7 +2534,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let address_space_id = unsafe { CURRENT_ASID };
 
+                if !validate_user_range(address_space_id, path_ptr, path_len, false) {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
                 let filesystem_ptr = &raw mut FILESYSTEM_PTR;
                 unsafe {
@@ -2514,6 +2569,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     }
                 };
                 if ptr < VMAP_START || end > VMAP_END{
+                    frame.x[0] = (-1i64) as u64;
+                    return;
+                }
+                let address_space_id = unsafe { CURRENT_ASID };
+
+                if !validate_user_range(address_space_id, ptr, len, false) {
                     frame.x[0] = (-1i64) as u64;
                     return;
                 }
@@ -2559,7 +2620,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let address_space_id = unsafe { CURRENT_ASID };
 
+                if !validate_user_range(address_space_id, path_ptr, path_len, false) {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
                 let filesystem_ptr = &raw mut FILESYSTEM_PTR;
                 unsafe {
@@ -2588,7 +2654,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let address_space_id = unsafe { CURRENT_ASID };
 
+                if !validate_user_range(address_space_id, path_ptr, path_len, false) {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
                 let filesystem_ptr = &raw mut FILESYSTEM_PTR;
                 unsafe {
@@ -2617,7 +2688,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     frame.x[0] = u64::MAX;
                     return;
                 }
+                let address_space_id = unsafe { CURRENT_ASID };
 
+                if !validate_user_range(address_space_id, path_ptr, path_len, false) {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
                 let mut path = [0u8; 512];
                 unsafe {
                     core::ptr::copy_nonoverlapping(path_ptr as *const u8, path.as_mut_ptr(), path_len);
@@ -2718,6 +2794,14 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     || path_end > VMAP_END
                     || buffer_ptr < VMAP_START
                     || buffer_end > VMAP_END
+                {
+                    frame.x[0] = u64::MAX;
+                    return;
+                }
+                let address_space_id = unsafe { CURRENT_ASID };
+
+                if !validate_user_range(address_space_id, path_ptr, path_len, false)
+                    || !validate_user_range(address_space_id, buffer_ptr, buffer_len, true)
                 {
                     frame.x[0] = u64::MAX;
                     return;
