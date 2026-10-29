@@ -117,10 +117,9 @@ Otherwise, we mount it directly.
 The kernel then prints some diagnostic information on the drive, such as its size, and the block size it has been formatted with.
 
 The kernel then automatically loads user-init.run (our shell program) for the drive. 
-It does try to continue execution, but Ouroboros doesn't actually do much without a shell. You effectively end up with an initialised, yet idle CPU.
+If it fails, it does try to continue execution, but Ouroboros doesn't actually do much without a shell. You effectively end up with an initialised, yet idle CPU.
 The kernel does **NOT** load the shell into the stack. This is only 16KiB in size, and the kernel crashes due to a stack overflow.
 It stores the program in a 49.1 KiB buffer (the old maximum size for a .run executable).
-If this buffer is exceeded, the shell will half-load, but cut off at the max size of the buffer.
 The kernel will inform you if the provided shell does not fit inside the buffer.
 
 ### Scheduler

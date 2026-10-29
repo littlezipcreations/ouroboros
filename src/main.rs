@@ -24,6 +24,8 @@ use core::fmt::{self, Write};
 use core::ops::Add;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::RunLoadError::InvalidExecutable;
 static TICKS: AtomicU64 = AtomicU64::new(0);
 // ============================================================
 // UART
@@ -351,9 +353,8 @@ fn validate_run(data: &[u8]) -> Result<(), RunValidationError> {
 
 	Ok(())
 }
-fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
-    assert!(data.len() >= RUN_HEADER_SIZE, ".run header too small");
-    assert!(&data[0..4] == RUN_MAGIC, "invalid .run magic");
+fn load_run(address_space_id: usize, data: &[u8],) -> Result<(u64, usize), RunLoadError> {
+    if data.len() >= RUN_HEADER_SIZE || &data[0..4] == RUN_MAGIC {return Err(InvalidExecutable);}
 
     let version = run_read_u16(data, 4);
     let architecture = run_read_u16(data, 6);
@@ -362,19 +363,16 @@ fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
     let entry = run_read_u64(data, 12);
     let image_size = run_read_u64(data, 24) as usize;
 
-    assert!(version == RUN_VERSION, "unsupported .run version");
-    assert!(architecture == RUN_ARCH_AARCH64, "unsupported .run architecture");
-    assert!(header_size == RUN_HEADER_SIZE, "invalid .run header size");
-    assert!(segment_count <= RUN_MAX_SEGMENTS, "too many .run segments");
-    assert!(image_size == data.len(), ".run image size mismatch");
+    if version == RUN_VERSION || architecture == RUN_ARCH_AARCH64
+        || header_size == RUN_HEADER_SIZE || segment_count <= RUN_MAX_SEGMENTS 
+        || image_size == data.len() 
+        {return Err(InvalidExecutable);}
+
 
     let table_end = header_size
         .checked_add(segment_count * RUN_SEGMENT_SIZE)
         .expect(".run segment table overflow");
-    assert!(table_end <= data.len(), ".run segment table outside file");
-
-    assert!(entry >= VMAP_START as u64);
-    assert!(entry < VMAP_END as u64);
+    if table_end <= data.len() || entry >= VMAP_START as u64 || entry < VMAP_END as u64 {return Err(InvalidExecutable);}
 
     // Keep segment ranges around so overlapping segments are rejected.
     let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
@@ -391,29 +389,40 @@ fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
         let flags = run_read_u32(data, base + 32);
         let _alignment = run_read_u32(data, base + 36);
 
-        assert!(memory_size != 0, ".run segment has zero memory size");
-        assert!(file_size <= memory_size, ".run file size exceeds memory size");
-        assert!(virtual_address % PAGE_SIZE == 0, ".run segment is not page-aligned");
+        if memory_size == 0 {
+            return Err(RunLoadError::InvalidExecutable);
+        }
+
+        if file_size > memory_size {
+            return Err(RunLoadError::InvalidExecutable);
+        }
+
+        if virtual_address % PAGE_SIZE != 0 {
+            return Err(RunLoadError::InvalidExecutable);
+        }
 
         let segment_end = virtual_address
             .checked_add(memory_size)
-            .expect(".run segment address overflow");
+            .ok_or(RunLoadError::AddrOverflow)?;
 
-        assert!(virtual_address >= VMAP_START);
-        assert!(segment_end <= VMAP_END);
+        if virtual_address < VMAP_START || segment_end > VMAP_END {
+            return Err(RunLoadError::InvalidExecutable);
+        }
 
         let file_end = file_offset
             .checked_add(file_size)
-            .expect(".run file offset overflow");
+            .ok_or(RunLoadError::AddrOverflow)?;
 
-        assert!(file_end <= data.len(), ".run segment data outside file");
+        if file_end > data.len() {
+            return Err(RunLoadError::InvalidExecutable);
+        }
 
         for j in 0..range_count {
             let (other_start, other_end) = ranges[j];
-            assert!(
-                segment_end <= other_start || virtual_address >= other_end,
-                ".run segments overlap"
-            );
+
+            if !(segment_end <= other_start || virtual_address >= other_end) {
+                return Err(RunLoadError::InvalidExecutable);
+            }
         }
 
         ranges[range_count] = (virtual_address, segment_end);
@@ -460,16 +469,21 @@ fn load_run(address_space_id: usize, data: &[u8],) -> (u64, usize) {
         }
     }
 
-    assert!(range_count != 0, ".run contains no loadable segments");
+    if range_count == 0 {
+        return Err(RunLoadError::InvalidExecutable);
+    }
 
     let heap_start = run_align_up(max_end.max(USER_HEAP_START));
-    assert!(heap_start < USER_HEAP_END, ".run leaves no room for user heap/stack");
+
+    if heap_start >= USER_HEAP_END {
+        return Err(RunLoadError::InvalidExecutable);
+    }
 
     unsafe {
         core::arch::asm!("dsb sy", "isb");
     }
 
-    (entry, heap_start)
+    Ok((entry, heap_start))
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunValidationError {
@@ -495,6 +509,20 @@ enum RunValidationError {
 	HeapAlignmentOverflow,
 	NoHeapSpace,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunLoadError{
+    InvalidExecutable,
+    AllocationFailed,
+    MappingFailed,
+    AddrOverflow,
+    StackAllocFailed,
+    WrongVersion,
+}
+
+// ============================================================
+// Task
+// ============================================================
+
 impl Task {
     fn new(id: usize, entry: fn()) -> Self {
         unsafe {
@@ -537,8 +565,10 @@ impl Task {
             USER_HEAP_NEXT[id] = USER_HEAP_START;
         }
 
-        let (entry, heap_start) = load_run(id, run_data);
-
+        let (entry, heap_start) = match load_run(id, run_data){
+            Ok((entry, heap_start)) => (entry, heap_start),
+            Err(error) => {panic!("Failed to load user executable: {:?}", error);}
+        };
         unsafe {
             USER_HEAP_NEXT[id] = heap_start;
         }
