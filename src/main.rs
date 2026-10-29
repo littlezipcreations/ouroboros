@@ -26,6 +26,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::RunLoadError::InvalidExecutable;
+use crate::TaskCreationError::{FailedAlloc, NoFreeSlot};
 static TICKS: AtomicU64 = AtomicU64::new(0);
 // ============================================================
 // UART
@@ -353,137 +354,177 @@ fn validate_run(data: &[u8]) -> Result<(), RunValidationError> {
 
 	Ok(())
 }
-fn load_run(address_space_id: usize, data: &[u8],) -> Result<(u64, usize), RunLoadError> {
-    if data.len() >= RUN_HEADER_SIZE || &data[0..4] == RUN_MAGIC {return Err(InvalidExecutable);}
+fn load_run(
+	address_space_id: usize,
+	data: &[u8],
+) -> Result<(u64, usize), RunLoadError> {
+	// Validate the header before reading any fields.
+	if data.len() < RUN_HEADER_SIZE || &data[0..4] != RUN_MAGIC {
+		return Err(RunLoadError::InvalidExecutable);
+	}
 
-    let version = run_read_u16(data, 4);
-    let architecture = run_read_u16(data, 6);
-    let header_size = run_read_u16(data, 8) as usize;
-    let segment_count = run_read_u16(data, 10) as usize;
-    let entry = run_read_u64(data, 12);
-    let image_size = run_read_u64(data, 24) as usize;
+	let version = run_read_u16(data, 4);
+	let architecture = run_read_u16(data, 6);
+	let header_size = run_read_u16(data, 8) as usize;
+	let segment_count = run_read_u16(data, 10) as usize;
+	let entry = run_read_u64(data, 12);
+	let image_size = run_read_u64(data, 24) as usize;
 
-    if version == RUN_VERSION || architecture == RUN_ARCH_AARCH64
-        || header_size == RUN_HEADER_SIZE || segment_count <= RUN_MAX_SEGMENTS 
-        || image_size == data.len() 
-        {return Err(InvalidExecutable);}
+	if version != RUN_VERSION
+		|| architecture != RUN_ARCH_AARCH64
+		|| header_size != RUN_HEADER_SIZE
+		|| segment_count == 0
+		|| segment_count > RUN_MAX_SEGMENTS
+		|| image_size != data.len()
+	{
+		return Err(RunLoadError::InvalidExecutable);
+	}
 
+	let table_size = segment_count
+		.checked_mul(RUN_SEGMENT_SIZE)
+		.ok_or(RunLoadError::InvalidExecutable)?;
 
-    let table_end = header_size
-        .checked_add(segment_count * RUN_SEGMENT_SIZE)
-        .expect(".run segment table overflow");
-    if table_end <= data.len() || entry >= VMAP_START as u64 || entry < VMAP_END as u64 {return Err(InvalidExecutable);}
+	let table_end = header_size
+		.checked_add(table_size)
+		.ok_or(RunLoadError::InvalidExecutable)?;
 
-    // Keep segment ranges around so overlapping segments are rejected.
-    let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
-    let mut range_count = 0usize;
-    let mut max_end = VMAP_START;
+	if table_end > data.len()
+		|| entry < VMAP_START as u64
+		|| entry >= VMAP_END as u64
+	{
+		return Err(RunLoadError::InvalidExecutable);
+	}
 
-    for i in 0..segment_count {
-        let base = header_size + i * RUN_SEGMENT_SIZE;
+	// Keep segment ranges around so overlapping segments are rejected.
+	let mut ranges = [(0usize, 0usize); RUN_MAX_SEGMENTS];
+	let mut range_count = 0usize;
+	let mut max_end = VMAP_START;
+	let mut entry_is_executable = false;
 
-        let virtual_address = run_read_u64(data, base) as usize;
-        let file_offset = run_read_u64(data, base + 8) as usize;
-        let file_size = run_read_u64(data, base + 16) as usize;
-        let memory_size = run_read_u64(data, base + 24) as usize;
-        let flags = run_read_u32(data, base + 32);
-        let _alignment = run_read_u32(data, base + 36);
+	// Validate every segment before allocating or mapping any pages.
+	for i in 0..segment_count {
+		let base = header_size + i * RUN_SEGMENT_SIZE;
 
-        if memory_size == 0 {
-            return Err(RunLoadError::InvalidExecutable);
-        }
+		let virtual_address = usize::try_from(run_read_u64(data, base))
+			.map_err(|_| RunLoadError::AddrOverflow)?;
+		let file_offset = usize::try_from(run_read_u64(data, base + 8))
+			.map_err(|_| RunLoadError::AddrOverflow)?;
+		let file_size = usize::try_from(run_read_u64(data, base + 16))
+			.map_err(|_| RunLoadError::AddrOverflow)?;
+		let memory_size = usize::try_from(run_read_u64(data, base + 24))
+			.map_err(|_| RunLoadError::AddrOverflow)?;
+		let flags = run_read_u32(data, base + 32);
 
-        if file_size > memory_size {
-            return Err(RunLoadError::InvalidExecutable);
-        }
+		if memory_size == 0
+			|| file_size > memory_size
+			|| virtual_address % PAGE_SIZE != 0
+			|| flags & !(RUN_R | RUN_W | RUN_X) != 0
+		{
+			return Err(RunLoadError::InvalidExecutable);
+		}
 
-        if virtual_address % PAGE_SIZE != 0 {
-            return Err(RunLoadError::InvalidExecutable);
-        }
+		let segment_end = virtual_address
+			.checked_add(memory_size)
+			.ok_or(RunLoadError::AddrOverflow)?;
 
-        let segment_end = virtual_address
-            .checked_add(memory_size)
-            .ok_or(RunLoadError::AddrOverflow)?;
+		if virtual_address < VMAP_START || segment_end > VMAP_END {
+			return Err(RunLoadError::InvalidExecutable);
+		}
 
-        if virtual_address < VMAP_START || segment_end > VMAP_END {
-            return Err(RunLoadError::InvalidExecutable);
-        }
+		let file_end = file_offset
+			.checked_add(file_size)
+			.ok_or(RunLoadError::AddrOverflow)?;
 
-        let file_end = file_offset
-            .checked_add(file_size)
-            .ok_or(RunLoadError::AddrOverflow)?;
+		if file_offset < table_end || file_end > data.len() {
+			return Err(RunLoadError::InvalidExecutable);
+		}
 
-        if file_end > data.len() {
-            return Err(RunLoadError::InvalidExecutable);
-        }
+		for j in 0..range_count {
+			let (other_start, other_end) = ranges[j];
 
-        for j in 0..range_count {
-            let (other_start, other_end) = ranges[j];
+			if !(segment_end <= other_start || virtual_address >= other_end) {
+				return Err(RunLoadError::InvalidExecutable);
+			}
+		}
 
-            if !(segment_end <= other_start || virtual_address >= other_end) {
-                return Err(RunLoadError::InvalidExecutable);
-            }
-        }
+		ranges[range_count] = (virtual_address, segment_end);
+		range_count += 1;
 
-        ranges[range_count] = (virtual_address, segment_end);
-        range_count += 1;
+		max_end = max_end.max(segment_end);
 
-        if segment_end > max_end {
-            max_end = segment_end;
-        }
+		if (flags & RUN_X) != 0
+			&& entry >= virtual_address as u64
+			&& entry < segment_end as u64
+		{
+			entry_is_executable = true;
+		}
+	}
 
-        let pages = run_align_up(memory_size) / PAGE_SIZE;
-        let writable = (flags & RUN_W) != 0;
-        let executable = (flags & RUN_X) != 0;
+	if !entry_is_executable {
+		return Err(RunLoadError::InvalidExecutable);
+	}
 
-        for page in 0..pages {
-            let virtual_page = virtual_address + page * PAGE_SIZE;
-            let physical = alloc_page().expect("out of physical memory loading .run");
+	let heap_start = run_align_up(max_end.max(USER_HEAP_START));
 
-            unsafe {
-                core::ptr::write_bytes(
-                    physical as *mut u8,
-                    0,
-                    PAGE_SIZE,
-                );
+	if heap_start >= USER_HEAP_END {
+		return Err(RunLoadError::InvalidExecutable);
+	}
 
-                let remaining_file = file_size.saturating_sub(page * PAGE_SIZE);
-                let copy_len = remaining_file.min(PAGE_SIZE);
+	// All format validation has passed. Now load the segments.
+	for i in 0..segment_count {
+		let base = header_size + i * RUN_SEGMENT_SIZE;
 
-                if copy_len != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(file_offset + page * PAGE_SIZE),
-                        physical as *mut u8,
-                        copy_len,
-                    );
-                }
+		let virtual_address = run_read_u64(data, base) as usize;
+		let file_offset = run_read_u64(data, base + 8) as usize;
+		let file_size = run_read_u64(data, base + 16) as usize;
+		let memory_size = run_read_u64(data, base + 24) as usize;
+		let flags = run_read_u32(data, base + 32);
 
-                map_run_page(
-                    &mut ADDRESS_SPACES[address_space_id],
-                    virtual_page,
-                    physical,
-                    writable,
-                    executable,
-                );
-            }
-        }
-    }
+		let pages = run_align_up(memory_size) / PAGE_SIZE;
+		let writable = (flags & RUN_W) != 0;
+		let executable = (flags & RUN_X) != 0;
 
-    if range_count == 0 {
-        return Err(RunLoadError::InvalidExecutable);
-    }
+		for page in 0..pages {
+			let virtual_page = virtual_address + page * PAGE_SIZE;
 
-    let heap_start = run_align_up(max_end.max(USER_HEAP_START));
+			let physical = alloc_page()
+				.ok_or(RunLoadError::AllocationFailed)?;
 
-    if heap_start >= USER_HEAP_END {
-        return Err(RunLoadError::InvalidExecutable);
-    }
+			unsafe {
+				core::ptr::write_bytes(
+					physical as *mut u8,
+					0,
+					PAGE_SIZE,
+				);
 
-    unsafe {
-        core::arch::asm!("dsb sy", "isb");
-    }
+				let page_offset = page * PAGE_SIZE;
+				let remaining_file = file_size.saturating_sub(page_offset);
+				let copy_len = remaining_file.min(PAGE_SIZE);
 
-    Ok((entry, heap_start))
+				if copy_len != 0 {
+					core::ptr::copy_nonoverlapping(
+						data.as_ptr().add(file_offset + page_offset),
+						physical as *mut u8,
+						copy_len,
+					);
+				}
+
+				map_run_page(
+					&mut ADDRESS_SPACES[address_space_id],
+					virtual_page,
+					physical,
+					writable,
+					executable,
+				);
+			}
+		}
+	}
+
+	unsafe {
+		core::arch::asm!("dsb sy", "isb");
+	}
+
+	Ok((entry, heap_start))
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunValidationError {
@@ -559,60 +600,71 @@ impl Task {
 
         task
     }
-    fn new_user(id: usize, run_data: &[u8]) -> Self {
+    fn new_user(id: usize, run_data: &[u8]) -> Result<Self, TaskCreationError> {
         unsafe {
             ADDRESS_SPACES[id].init();
             USER_HEAP_NEXT[id] = USER_HEAP_START;
         }
 
-        let (entry, heap_start) = match load_run(id, run_data){
-            Ok((entry, heap_start)) => (entry, heap_start),
-            Err(error) => {panic!("Failed to load user executable: {:?}", error);}
-        };
-        unsafe {
-            USER_HEAP_NEXT[id] = heap_start;
-        }
-
-        let stack_top = USER_STACK_TOP;
-
-        for i in 0..(USER_STACK_SIZE / PAGE_SIZE) {
-            let physical = alloc_page()
-                .expect("Failed to allocate page for user stack");
-
-            let virtual_address =
-                USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
+        let result = (|| -> Result<Self, TaskCreationError> {
+            let (entry, heap_start) = load_run(id, run_data)
+                .map_err(|error| match error {
+                    RunLoadError::AllocationFailed
+                    | RunLoadError::StackAllocFailed => FailedAlloc,
+                    _ => TaskCreationError::InvalidExecutable,
+                })?;
 
             unsafe {
-                core::ptr::write_bytes(
-                    physical as *mut u8,
-                    0,
-                    PAGE_SIZE,
-                );
-                map_user_page(
-                    &mut ADDRESS_SPACES[id],
-                    virtual_address,
-                    physical,
-                    false,
-                );
+                USER_HEAP_NEXT[id] = heap_start;
             }
+
+            let stack_top = USER_STACK_TOP;
+
+            for i in 0..(USER_STACK_SIZE / PAGE_SIZE) {
+                let physical = alloc_page().ok_or(FailedAlloc)?;
+
+                let virtual_address =
+                    USER_STACK_TOP as usize - USER_STACK_SIZE + i * PAGE_SIZE;
+
+                unsafe {
+                    core::ptr::write_bytes(
+                        physical as *mut u8,
+                        0,
+                        PAGE_SIZE,
+                    );
+
+                    map_user_page(
+                        &mut ADDRESS_SPACES[id],
+                        virtual_address,
+                        physical,
+                        false,
+                    );
+                }
+            }
+
+            let kernel_stack_top = unsafe {
+                TASK_STACKS[id].0.as_ptr() as u64 + TASK_STACK_SIZE as u64
+            };
+
+            Ok(Self {
+                id,
+                state: TaskState::Ready,
+                address_space_id: id,
+                context: CpuContext {
+                    x: [0; 31],
+                    sp: stack_top,
+                    pc: entry,
+                    spsr: SPSR_EL0T,
+                    kernel_sp: kernel_stack_top,
+                },
+            })
+        })();
+
+        if result.is_err() {
+            reclaim_user_pages(id);
         }
 
-        let kernel_stack_top = unsafe {
-            TASK_STACKS[id].0.as_ptr() as u64 + TASK_STACK_SIZE as u64
-        };
-
-        Self {
-            id,
-            state: TaskState::Ready,
-            address_space_id: id,
-            context: CpuContext {
-                x: [0; 31],
-                sp: stack_top,
-                pc: entry,
-                spsr: SPSR_EL0T,
-                kernel_sp: kernel_stack_top,
-            },
-        }
+        result
     }
     fn save_context(&mut self, frame: &ExceptionFrame) {
         self.context.x.copy_from_slice(&frame.x);
@@ -627,6 +679,12 @@ impl Task {
         frame.spsr = self.context.spsr;
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCreationError{
+    InvalidExecutable,
+    NoFreeSlot,
+    FailedAlloc,
+}
 struct TaskTable {
     tasks: [Option<Task>; MAX_TASKS],
     count: usize,
@@ -638,14 +696,14 @@ impl TaskTable {
             count: 0,
         }
     }
-    fn create(&mut self, entry: fn()) -> usize {
+    fn create(&mut self, entry: fn()) -> Result<usize, TaskCreationError> {
         if self.count >= MAX_TASKS {
-            panic!("No free task slots");
+            return Err(NoFreeSlot);
         }
         let id = self.count;
         self.tasks[id] = Some(Task::new(id, entry));
         self.count += 1;
-        id
+        Ok(id)
     }      
     fn available_slot(&self) -> Option<usize> {
         if self.count == 0 {
@@ -668,18 +726,19 @@ impl TaskTable {
             None
         }
     }
-    fn create_user(&mut self, runData: &[u8]) -> usize {
+    fn create_user(&mut self, runData: &[u8]) -> Result<usize, TaskCreationError> {
         let id = self
             .available_slot()
-            .expect("No free task slots");
+            .ok_or(NoFreeSlot)?;
 
-        self.tasks[id] = Some(Task::new_user(id, runData));
+        let task = Task::new_user(id, runData)?;
+        self.tasks[id] = Some(task);
 
         if id == self.count {
             self.count += 1;
         }
 
-        id
+        Ok(id)
     }
 
 }
@@ -1342,10 +1401,16 @@ impl Scheduler {
         }
     }
     fn add_task(&mut self, entry: fn()) -> usize {
-        self.tasks.create(entry)
+        match self.tasks.create(entry){
+            Ok(usize) => {usize},
+            Err(err) => {usize::MAX}
+        }
     }
     fn add_user_task(&mut self, runData: &[u8]) -> usize {
-        self.tasks.create_user(runData)
+        match self.tasks.create_user(runData){
+            Ok(usize) => {usize},
+            Err(err) => {usize::MAX}
+        }
     }
     fn next_ready(&self) -> Option<usize> {
         if self.tasks.count <= 1 {
