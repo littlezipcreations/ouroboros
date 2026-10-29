@@ -25,6 +25,7 @@ use core::ops::Add;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::MappingError::AlreadyMapped;
 use crate::RunLoadError::InvalidExecutable;
 use crate::TaskCreationError::{FailedAlloc, NoFreeSlot};
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -354,10 +355,7 @@ fn validate_run(data: &[u8]) -> Result<(), RunValidationError> {
 
 	Ok(())
 }
-fn load_run(
-	address_space_id: usize,
-	data: &[u8],
-) -> Result<(u64, usize), RunLoadError> {
+fn load_run(address_space_id: usize, data: &[u8],) -> Result<(u64, usize), RunLoadError> {
 	// Validate the header before reading any fields.
 	if data.len() < RUN_HEADER_SIZE || &data[0..4] != RUN_MAGIC {
 		return Err(RunLoadError::InvalidExecutable);
@@ -509,13 +507,19 @@ fn load_run(
 					);
 				}
 
-				map_run_page(
+				match map_run_page(
 					&mut ADDRESS_SPACES[address_space_id],
 					virtual_page,
 					physical,
 					writable,
 					executable,
-				);
+				) {
+                    Ok(()) => {}
+                    Err(_) =>{
+                        free_page(physical);
+                        return Err(RunLoadError::MappingFailed)
+                    }
+                }
 			}
 		}
 	}
@@ -1847,14 +1851,14 @@ fn free_virtual_page(address: usize){
     assert!(is_virtual_page_used(page));
     mark_virtual_page_free(page);
 }
-unsafe fn map_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize){
-    assert!(virt_addr % PAGE_SIZE == 0);
-    assert!(phys_addr % PAGE_SIZE == 0);
-    assert!(virt_addr >= VMAP_START);
-    assert!(virt_addr < VMAP_END);
+unsafe fn map_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize) -> Result<(), MappingError>{
+    if virt_addr % PAGE_SIZE != 0 ||phys_addr % PAGE_SIZE != 0 {return Err(MappingError::UnalignedAddr);}
+    if virt_addr < VMAP_START || virt_addr >= VMAP_END {return Err(MappingError::AddrOutOfRange);}
 
     let index = (virt_addr >> 12) & 0x1FF;
-    assert!(!address_space.l3_vmap.entries[index].is_valid());
+    if address_space.l3_vmap.entries[index].is_valid() {
+        return Err(MappingError::AlreadyMapped);
+    }
     address_space.l3_vmap.entries[index] = 
         PageTableEntry::new_page(
             phys_addr,
@@ -1862,34 +1866,32 @@ unsafe fn map_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr
             0b00,
             0b11,
             false
-        )
+        );
+    Ok(())
 }
-unsafe fn map_user_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize, executable: bool){
-    assert!(virt_addr % PAGE_SIZE == 0);
-    assert!(phys_addr % PAGE_SIZE == 0);
-    assert!(virt_addr >= VMAP_START);
-    assert!(virt_addr < VMAP_END);
+unsafe fn map_user_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize, executable: bool) -> Result<(), MappingError>{
+    if virt_addr % PAGE_SIZE != 0 ||phys_addr % PAGE_SIZE != 0 {return Err(MappingError::UnalignedAddr);}
+    if virt_addr < VMAP_START || virt_addr >= VMAP_END {return Err(MappingError::AddrOutOfRange);}
+
     let index = (virt_addr >> 12) & 0x1FF;
-    assert!(!address_space.l3_vmap.entries[index].is_valid());
+    if address_space.l3_vmap.entries[index].is_valid() {
+        return Err(MappingError::AlreadyMapped);
+    }
     address_space.l3_vmap.entries[index] =
         PageTableEntry::new_page(
             phys_addr, ATTR_NORMAL, 0b01, 0b11, !executable
         );
+    Ok(())
 }
-unsafe fn map_run_page(
-    address_space: &mut AddressSpace,
-    virt_addr: usize,
-    phys_addr: usize,
-    writable: bool,
-    executable: bool,
-) {
-    assert!(virt_addr % PAGE_SIZE == 0);
-    assert!(phys_addr % PAGE_SIZE == 0);
-    assert!(virt_addr >= VMAP_START);
-    assert!(virt_addr < VMAP_END);
+unsafe fn map_run_page(address_space: &mut AddressSpace, virt_addr: usize, phys_addr: usize, writable: bool, executable: bool,) -> Result<(), MappingError> {
+    if virt_addr % PAGE_SIZE != 0 ||phys_addr % PAGE_SIZE != 0 {return Err(MappingError::UnalignedAddr);}
+    if virt_addr < VMAP_START || virt_addr >= VMAP_END {return Err(MappingError::AddrOutOfRange);}
+
 
     let index = (virt_addr >> 12) & 0x1FF;
-    assert!(!address_space.l3_vmap.entries[index].is_valid());
+    if address_space.l3_vmap.entries[index].is_valid() {
+        return Err(MappingError::AlreadyMapped);
+    }
 
     // AP=01: EL0 read/write.
     // AP=11: EL0 read-only.
@@ -1903,6 +1905,7 @@ unsafe fn map_run_page(
             0b11,
             !executable,
         );
+    Ok(())
 }
 unsafe fn map_user_stack(address_space: &mut AddressSpace) -> usize {
     let stack_bottom = USER_STACK_TOP as usize - USER_STACK_SIZE as usize;
@@ -1930,56 +1933,42 @@ unsafe fn unmap_page(address_space: &mut AddressSpace, virt_addr: usize) {
     address_space.l3_vmap.entries[index] = PageTableEntry::invalid();
 }
 fn reclaim_user_pages(addressSpaceId: usize) {
-    unsafe{
-        if addressSpaceId >= MAX_TASKS {
+    unsafe {
+        // ASID 0 owns general VM allocations and must never be reclaimed
+        // through the user-task teardown path.
+        if addressSpaceId == 0 || addressSpaceId >= MAX_TASKS {
             return;
         }
 
-        // Each entry corresponds to one possible 4 KiB user page.
-        let mut physicalPages = [0usize; 512];
-        let mut pageCount = 0usize;
+        let addressSpace = &mut ADDRESS_SPACES[addressSpaceId];
 
-        unsafe {
-            let addressSpaces = &raw mut ADDRESS_SPACES;
-            let entries =
-                &mut (*addressSpaces)[addressSpaceId].l3_vmap.entries;
+        for index in 0..512 {
+            let entry = addressSpace.l3_vmap.entries[index].0;
 
-            for entry in entries.iter_mut() {
-                if entry.is_valid() {
-                    let physical =
-                        (entry.0 & 0x0000_FFFF_FFFF_F000) as usize;
+            if entry & 1 != 0 {
+                let physAddr = ((entry & 0x0000_FFFF_FFFF_F000) >> 12) << 12;
 
-                    *entry = PageTableEntry::invalid();
-
-                    physicalPages[pageCount] = physical;
-                    pageCount += 1;
-                }
-            }
-
-            let heapNext = &raw mut USER_HEAP_NEXT;
-            (*heapNext)[addressSpaceId] = USER_HEAP_START;
-
-            // Remove stale translations before releasing physical pages.
-            core::arch::asm!(
-                "dsb ishst",
-                "tlbi vmalle1",
-                "dsb ish",
-                "isb",
-                options(nostack)
-            );
-        }
-
-        for physical in physicalPages[..pageCount].iter().copied() {
-            if physical >= FIRST_FREE_PAGE
-                && physical < RAM_END
-                && physical % PAGE_SIZE == 0
-            {
-                free_page(physical);
+                addressSpace.l3_vmap.entries[index].0 = 0;
+                free_page(physAddr as usize);
             }
         }
-    }   
+
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingError{
+    UnalignedAddr,
+    AddrOutOfRange,
+    AlreadyMapped
+}
 // ============================================================
 // Page tables
 // ============================================================
@@ -2242,6 +2231,11 @@ fn enable_mmu() {
 // ============================================================
 
 fn vm_alloc_page(address_space_id: usize) -> Option<usize> {
+    // General VM allocations belong exclusively to ASID 0.
+    if address_space_id != 0 {
+        return None;
+    }
+
     let physical = alloc_page()?;
 
     let virt_addr = match alloc_virtual_page() {
@@ -2252,24 +2246,46 @@ fn vm_alloc_page(address_space_id: usize) -> Option<usize> {
         }
     };
 
-    unsafe {
+    let result = unsafe {
         let address_space = &mut ADDRESS_SPACES[address_space_id];
+        map_page(address_space, virt_addr, physical)
+    };
 
-        map_page(address_space, virt_addr, physical);
+    if result.is_err() {
+        free_virtual_page(virt_addr);
+        free_page(physical);
+        return None;
     }
 
     Some(virt_addr)
 }
-fn vm_free_page(virt_addr: usize){
+fn vm_free_page(virt_addr: usize) {
     unsafe {
-        let address_space = &mut ADDRESS_SPACES[CURRENT_ASID];
+        assert!(virt_addr >= VMAP_START && virt_addr < VMAP_END);
+        assert!(virt_addr % PAGE_SIZE == 0);
+
+        // vm_alloc_page() allocates exclusively in ASID 0.
+        let addressSpace = &mut ADDRESS_SPACES[0];
         let index = (virt_addr >> 12) & 0x1FF;
-        assert!(ADDRESS_SPACES[CURRENT_ASID].l3_vmap.entries[index].is_valid());
-        let entry = ADDRESS_SPACES[CURRENT_ASID].l3_vmap.entries[index].0;
-        let phys_addr = (entry >> 12) << 12;
-        unmap_page(address_space, virt_addr);
+
+        assert!(addressSpace.l3_vmap.entries[index].is_valid());
+
+        let entry = addressSpace.l3_vmap.entries[index].0;
+        let physAddr = ((entry & 0x0000_FFFF_FFFF_F000) >> 12) << 12;
+
+        unmap_page(addressSpace, virt_addr);
+
+        // Invalidate stale translations before returning the physical page.
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+
         free_virtual_page(virt_addr);
-        free_page(phys_addr as usize);
+        free_page(physAddr as usize);
     }
 }
 unsafe fn switch_address_space(id: usize) {
@@ -2315,13 +2331,18 @@ fn alloc_user_pages(address_space_id: usize, pages: usize) -> Option<usize> {
 
         let virtual_address = start + mapped * PAGE_SIZE;
 
-        unsafe {
+                let mappingResult = unsafe {
             map_user_page(
                 &mut ADDRESS_SPACES[address_space_id],
                 virtual_address,
                 physical,
                 false,
-            );
+            )
+        };
+
+        if mappingResult.is_err() {
+            free_page(physical);
+            break;
         }
 
         mapped += 1;
