@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![warn(non_snake_case)]
 
 use ouroboros_system::syscall;
 use ouroboros_system::print;
@@ -8,6 +9,31 @@ use core::panic::PanicInfo;
 
 fn write_number(value: u64) {
     let _ = print!("{}", value);
+}
+
+fn error_message(error: syscall::Error) -> &'static str {
+    match error {
+        syscall::Error::NotFound => "not found",
+        syscall::Error::Unsupported => "operation not supported",
+        syscall::Error::InvalidArgument => "invalid argument",
+        syscall::Error::ResourceUnavailable => "resource unavailable",
+        syscall::Error::PermissionDenied => "permission denied",
+        syscall::Error::AlreadyExists => "already exists",
+        syscall::Error::NotDirectory => "not a directory",
+        syscall::Error::IsDirectory => "is a directory",
+        syscall::Error::DirectoryNotEmpty => "directory not empty",
+        syscall::Error::BufferTooSmall => "buffer too small",
+        syscall::Error::InvalidAddr => "invalid address",
+        syscall::Error::OoM => "out of memory",
+        syscall::Error::IoErr => "I/O error",
+        syscall::Error::WouldBlock => "would block",
+        syscall::Error::Unknown => "unknown error",
+    }
+}
+
+fn report_error(command: &[u8], error: syscall::Error) {
+    let _ = syscall::sys_write(command);
+    let _ = print!(": {}\r\n", error_message(error));
 }
 
 fn write_hex_byte(value: u8) {
@@ -109,8 +135,13 @@ fn read_line(buffer: &mut [u8]) -> usize {
 
     loop {
         let byte = match syscall::read_byte() {
-            Some(byte) => byte,
-            None => {
+            Ok(byte) => byte,
+            Err(syscall::Error::WouldBlock) => {
+                syscall::yield_now();
+                continue;
+            }
+            Err(error) => {
+                report_error(b"input", error);
                 syscall::yield_now();
                 continue;
             }
@@ -178,8 +209,12 @@ fn print_hex_dump(bytes: &[u8]) {
 
 fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
     let mut text_length = match syscall::read_file(path, scratch) {
-        Some(count) => count,
-        None => 0,
+        Ok(count) => count,
+        Err(syscall::Error::NotFound) => 0,
+        Err(error) => {
+            report_error(b"edit: read", error);
+            return false;
+        }
     };
 
     if text_length > 0 {
@@ -278,16 +313,14 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
             }
             b":w" | b":write" => {
                 match syscall::write_file(path, &scratch[..text_length]) {
-                    Some(count) => {
+                    Ok(count) => {
                         let _ = print!("Saved ");
                         write_number(count as u64);
                         let _ = print!(" bytes to ");
                         syscall::sys_write(path);
                         let _ = print!("\r\n");
                     }
-                    None => {
-                        let _ = print!("edit: save failed\r\n");
-                    }
+                    Err(error) => report_error(b"edit: save", error),
                 }
             }
             b":q" | b":quit" => {
@@ -296,7 +329,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
             }
             b":wq" | b":writequit" => {
                 match syscall::write_file(path, &scratch[..text_length]) {
-                    Some(count) => {
+                    Ok(count) => {
                         let _ = print!("Saved ");
                         write_number(count as u64);
                         let _ = print!(" bytes to ");
@@ -304,9 +337,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                         let _ = print!("\r\n");
                         return true;
                     }
-                    None => {
-                        let _ = print!("edit: save failed\r\n");
-                    }
+                    Err(error) => report_error(b"edit: save", error),
                 }
             }
             _ => {
@@ -333,8 +364,8 @@ fn shell() -> ! {
     // memory every time someone runs cat.
     let file_buffer = syscall::alloc_pages(FILE_BUFFER_PAGES);
 
-    if file_buffer.is_none() {
-        let _ = print!("Warning: filesystem buffer allocation failed.\r\n");
+    if let Err(error) = file_buffer {
+        report_error(b"Warning: filesystem buffer allocation", error);
     }
 
     let mut line = [0u8; 128];
@@ -347,8 +378,13 @@ fn shell() -> ! {
         // Collect one line of input.
         loop {
             let byte = match syscall::read_byte() {
-                Some(byte) => byte,
-                None => {
+                Ok(byte) => byte,
+                Err(syscall::Error::WouldBlock) => {
+                    syscall::yield_now();
+                    continue;
+                }
+                Err(error) => {
+                    report_error(b"input", error);
                     syscall::yield_now();
                     continue;
                 }
@@ -413,11 +449,8 @@ fn shell() -> ! {
         // ----------------------------------------------------
         else if command == b"df" || command.starts_with(b"df ") {
             let usage = match syscall::disk_usage() {
-                Some(usage) => usage,
-                None => {
-                    let _ = print!("df: filesystem query failed\r\n");
-                    continue;
-                }
+                Ok(usage) => usage,
+                Err(error) => { report_error(b"df", error); continue; }
             };
 
             let total_kib = usage.total_blocks.saturating_mul(usage.block_size) / 1024;
@@ -453,22 +486,17 @@ fn shell() -> ! {
             }
 
             let buffer = match file_buffer {
-                Some(ptr) => unsafe {
+                Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
-                None => {
-                    let _ = print!("hex: buffer allocation failed\r\n");
-                    continue;
-                }
+                Err(error) => { report_error(b"hex: buffer allocation", error); continue; }
             };
 
             match syscall::read_file(path, buffer) {
-                Some(count) => {
+                Ok(count) => {
                     print_hex_dump(&buffer[..count]);
                 }
-                None => {
-                    let _ = print!("hex: read failed\r\n");
-                }
+                Err(error) => report_error(b"hex", error),
             }
         }
 
@@ -484,13 +512,10 @@ fn shell() -> ! {
             }
 
             let buffer = match file_buffer {
-                Some(ptr) => unsafe {
+                Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
-                None => {
-                    let _ = print!("edit: buffer allocation failed\r\n");
-                    continue;
-                }
+                Err(error) => { report_error(b"edit: buffer allocation", error); continue; }
             };
 
             let _ = edit_file(path, buffer);
@@ -503,7 +528,7 @@ fn shell() -> ! {
             let path = &command[5..];
 
             match syscall::stat(path) {
-                Some(info) => {
+                Ok(info) => {
                     let _ = print!("inode: ");
                     write_number(info.inode);
 
@@ -525,9 +550,7 @@ fn shell() -> ! {
                     let _ = print!("\r\n");
                 }
 
-                None => {
-                    let _ = print!("stat: operation failed\r\n");
-                }
+                Err(error) => report_error(b"stat", error),
             }
         }
 
@@ -538,11 +561,8 @@ fn shell() -> ! {
             let path = &command[4..];
 
             let buffer_ptr = match file_buffer {
-                Some(ptr) => ptr,
-                None => {
-                    let _ = print!("cat: no filesystem buffer\r\n");
-                    continue;
-                }
+                Ok(ptr) => ptr,
+                Err(error) => { report_error(b"cat: buffer allocation", error); continue; }
             };
 
             let output = unsafe {
@@ -553,7 +573,7 @@ fn shell() -> ! {
             };
 
             match syscall::read_file(path, output) {
-                Some(count) => {
+                Ok(count) => {
                     if count > 0 {
                         syscall::sys_write(&output[..count]);
 
@@ -565,10 +585,7 @@ fn shell() -> ! {
                     }
                 }
 
-                None => {
-                    let _ = print!("cat: read failed; file may be missing \
-                          or too large\r\n");
-                }
+                Err(error) => report_error(b"cat", error),
             }
         }
 
@@ -579,11 +596,8 @@ fn shell() -> ! {
             let path = &command[6..];
 
             let buffer_ptr = match file_buffer {
-                Some(ptr) => ptr,
-                None => {
-                    let _ = print!("touch: no filesystem buffer\r\n");
-                    continue;
-                }
+                Ok(ptr) => ptr,
+                Err(error) => { report_error(b"touch: buffer allocation", error); continue; }
             };
 
             // The zero-length slice points into allocated
@@ -593,15 +607,13 @@ fn shell() -> ! {
             };
 
             match syscall::create_file(path, empty_data) {
-                Some(inode) => {
+                Ok(inode) => {
                     let _ = print!("Created inode ");
                     write_number(inode as u64);
                     let _ = print!("\r\n");
                 }
 
-                None => {
-                    let _ = print!("touch: create failed; path may exist\r\n");
-                }
+                Err(error) => report_error(b"touch", error),
             }
         }
 
@@ -618,15 +630,13 @@ fn shell() -> ! {
                     let contents = &arguments[separator + 1..];
 
                     match syscall::write_file(path, contents) {
-                        Some(count) => {
+                        Ok(count) => {
                             let _ = print!("Wrote ");
                             write_number(count as u64);
                             let _ = print!(" bytes\r\n");
                         }
 
-                        None => {
-                            let _ = print!("write: operation failed\r\n");
-                        }
+                        Err(error) => report_error(b"write", error),
                     }
                 }
 
@@ -642,10 +652,9 @@ fn shell() -> ! {
         else if command.starts_with(b"rm ") {
             let path = &command[3..];
 
-            if syscall::delete_file(path) {
-                let _ = print!("File deleted.\r\n");
-            } else {
-                let _ = print!("rm: deletion failed\r\n");
+            match syscall::delete_file(path) {
+                Ok(()) => { let _ = print!("File deleted.\r\n"); }
+                Err(error) => report_error(b"rm", error),
             }
         }
 
@@ -656,15 +665,13 @@ fn shell() -> ! {
             let path = &command[6..];
 
             match syscall::create_dir(path) {
-                Some(inode) => {
+                Ok(inode) => {
                     let _ = print!("Created directory inode ");
                     write_number(inode as u64);
                     let _ = print!("\r\n");
                 }
 
-                None => {
-                    let _ = print!("mkdir: operation failed\r\n");
-                }
+                Err(error) => report_error(b"mkdir", error),
             }
         }
 
@@ -674,10 +681,9 @@ fn shell() -> ! {
         else if command.starts_with(b"rmdir ") {
             let path = &command[6..];
 
-            if syscall::remove_dir(path) {
-                let _ = print!("Directory removed.\r\n");
-            } else {
-                let _ = print!("rmdir: removal failed; directory may not be empty\r\n");
+            match syscall::remove_dir(path) {
+                Ok(()) => { let _ = print!("Directory removed.\r\n"); }
+                Err(error) => report_error(b"rmdir", error),
             }
         }
 
@@ -688,15 +694,13 @@ fn shell() -> ! {
             let path = &command[4..];
             if path == b"/bin/user-init.run"{let _ = print!("You should NOT be trying to open a nested shell.\r\n"); continue;}
             match syscall::spawn(path) {
-                Some(task_id) => {
+                Ok(task_id) => {
                     let _ = print!("Completed task ");
                     write_number(task_id as u64);
                     let _ = print!("\r\n");
                 }
 
-                None => {
-                    let _ = print!("run: executable could not be started\r\n");
-                }
+                Err(error) => report_error(b"run", error),
             }
         }
 
@@ -723,22 +727,17 @@ fn shell() -> ! {
             }
 
             let buffer = match file_buffer {
-                Some(ptr) => unsafe {
+                Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, 12 * 4096)
                 },
-                None => {
-                    let _ = print!("ls: file buffer allocation failed\n");
-                    continue;
-                }
+                Err(error) => { report_error(b"ls: buffer allocation", error); continue; }
             };
 
             match syscall::list_directory(path, buffer) {
-                Some(count) => {
+                Ok(count) => {
                     syscall::sys_write(&buffer[..count]);
                 }
-                None => {
-                    let _ = print!("ls: cannot list directory (missing path or buffer too small)\n");
-                }
+                Err(error) => report_error(b"ls", error),
             }
         }
         // ----------------------------------------------------
@@ -754,28 +753,28 @@ fn shell() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-	shell();
+    shell();
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-	let message = b"\nUSERSPACE PANIC\n";
+    let message = b"\nUSERSPACE PANIC\n";
 
-	unsafe {
-		asm!(
-			"svc #3",
-			inlateout("x0") message.as_ptr() as u64 => _,
-			in("x1") message.len() as u64,
-			options(nostack)
-		);
+    unsafe {
+        asm!(
+            "svc #3",
+            inlateout("x0") message.as_ptr() as u64 => _,
+            in("x1") message.len() as u64,
+            options(nostack)
+        );
 
-		// Exit this userspace task.
-		asm!("svc #1", options(nostack));
-	}
+        // Exit this userspace task.
+        asm!("svc #1", options(nostack));
+    }
 
-	loop {
-		unsafe {
-			asm!("svc #2", options(nomem, nostack));
-		}
-	}
-}
+    loop {
+        unsafe {
+            asm!("svc #2", options(nomem, nostack));
+        }
+    }
+}  

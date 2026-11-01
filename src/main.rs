@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::MappingError::AlreadyMapped;
 use crate::RunLoadError::InvalidExecutable;
 use crate::TaskCreationError::{FailedAlloc, NoFreeSlot};
+use crate::syscallError::{InvalidAddr, IoErr, NotDirectory, OoM, PermissionDenied, ResourceUnavailable, Unknown, WouldBlock};
 static TICKS: AtomicU64 = AtomicU64::new(0);
 // ============================================================
 // UART
@@ -2498,12 +2499,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let end = match ptr.checked_add(len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = (-1i64) as u64;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if !validate_user_range(unsafe{CURRENT_ASID}, ptr, len, false) {
-                    frame.x[0] = (-1i64) as u64;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let bytes = unsafe {
@@ -2528,7 +2529,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     pages,
                 ) {
                     Some(address) => address as u64,
-                    None => 0,
+                    None => encode_error(OoM),
                 };
 
                 return;
@@ -2536,7 +2537,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
             5 => {
                 frame.x[0] = match uart.try_get_byte(){
                     Some(byte) => byte as u64,
-                    None => u64::MAX,
+                    None => encode_error(WouldBlock)
                 };
                 return;
             }
@@ -2549,25 +2550,25 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let path_end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 let data_end = match data_ptr.checked_add(data_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || path_end > VMAP_END || data_ptr < VMAP_START || data_end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let addr_space_id = unsafe{CURRENT_ASID};
                 if !validate_user_range(addr_space_id, path_ptr, path_len, false
                 || !validate_user_range(addr_space_id, data_ptr, data_len, false)){
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
 
@@ -2578,10 +2579,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.createFilePath(path, data) {
                             Ok(inode) => frame.x[0] = inode as u64,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr),
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2595,19 +2596,19 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let path_end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 let buffer_end = match buffer_ptr.checked_add(buffer_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || path_end > VMAP_END || buffer_ptr < VMAP_START || buffer_end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
@@ -2615,7 +2616,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 if !validate_user_range(address_space_id, path_ptr, path_len, false)
                     || !validate_user_range(address_space_id, buffer_ptr, buffer_len, true)
                 {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
 
@@ -2626,10 +2627,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.readFilePath(path, buffer) {
                             Ok(size) => frame.x[0] = size as u64,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr)
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2643,19 +2644,19 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let path_end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 let data_end = match data_ptr.checked_add(data_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || path_end > VMAP_END || data_ptr < VMAP_START || data_end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
@@ -2663,7 +2664,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 if !validate_user_range(address_space_id, path_ptr, path_len, false)
                     || !validate_user_range(address_space_id, data_ptr, data_len, false)
                 {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
 
@@ -2674,10 +2675,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.writeFilePath(path, data) {
                             Ok(size) => frame.x[0] = size as u64,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr)
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2688,18 +2689,18 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
 
                 if !validate_user_range(address_space_id, path_ptr, path_len, false) {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
@@ -2708,10 +2709,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.deleteFilePath(path) {
                             Ok(()) => frame.x[0] = 0,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr),
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2720,24 +2721,24 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let ptr = frame.x[0] as usize;
                 let len = frame.x[1] as usize;
                 if len == 0 || len > 512{
-                    frame.x[0] = (-1i64) as u64;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let end = match ptr.checked_add(len){
                     Some(end) => end,
                     None =>{
-                        frame.x[0] = (-1i64) as u64;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if ptr < VMAP_START || end > VMAP_END{
-                    frame.x[0] = (-1i64) as u64;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
 
                 if !validate_user_range(address_space_id, ptr, len, false) {
-                    frame.x[0] = (-1i64) as u64;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let mut path = [0u8; 512];
@@ -2758,11 +2759,11 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                                 frame.x[3] = stat.links as u64;
                             }
                             Err(()) => {
-                                frame.x[0] = (-1i64) as u64;
+                                set_syscall_error(frame, IoErr)
                             }
                         }
                     } else {
-                        frame.x[0] = (-1i64) as u64;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
 
@@ -2774,18 +2775,18 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
 
                 if !validate_user_range(address_space_id, path_ptr, path_len, false) {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
@@ -2794,10 +2795,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.createDirectoryPath(path) {
                             Ok(inode) => frame.x[0] = inode as u64,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr),
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2808,18 +2809,18 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_ptr < VMAP_START || end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
 
                 if !validate_user_range(address_space_id, path_ptr, path_len, false) {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
@@ -2828,10 +2829,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     if let Some(filesystem) = (*filesystem_ptr).as_mut() {
                         match filesystem.removeDirectoryPath(path) {
                             Ok(()) => frame.x[0] = 0,
-                            Err(()) => frame.x[0] = u64::MAX,
+                            Err(()) => set_syscall_error(frame, IoErr),
                         }
                     } else {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, ResourceUnavailable);
                     }
                 }
                 return;
@@ -2842,18 +2843,18 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
                 if path_len == 0 || path_len > 512 || path_ptr < VMAP_START || end > VMAP_END {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
 
                 if !validate_user_range(address_space_id, path_ptr, path_len, false) {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let mut path = [0u8; 512];
@@ -2867,20 +2868,20 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     let filesystem = match (*filesystem_ptr).as_mut() {
                         Some(filesystem) => filesystem,
                         None => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, ResourceUnavailable);
                             return;
                         }
                     };
                     let scheduler = match (*scheduler_ptr).as_mut() {
                         Some(scheduler) => scheduler,
                         None => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, ResourceUnavailable);
                             return;
                         }
                     };
                     if scheduler.foreground.is_some() || scheduler.tasks.available_slot().is_none()
                         {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, PermissionDenied);
                             return;
                         }
 
@@ -2893,13 +2894,13 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     let run_size = match filesystem.readFilePath(&path[..path_len], run_buffer) {
                         Ok(size) => size,
                         Err(()) => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, InvalidAddr);
                             return;
                         }
                     };
 
                     if run_size == 0 || run_size > MAX_RUN_SIZE {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
 
@@ -2909,12 +2910,12 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     );
 
                     if let Err(error) = validate_run(run_data) {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, syscallError::Unknown);
                         return;
                     }
 
                     if !scheduler.spawn_foreground_user(run_data, frame) {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, Unknown);
                     }
 
                     return;
@@ -2932,14 +2933,14 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     || buffer_len == 0
                     || buffer_len > MAX_RUN_SIZE
                 {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
 
                 let path_end = match path_ptr.checked_add(path_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
@@ -2947,7 +2948,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 let buffer_end = match buffer_ptr.checked_add(buffer_len) {
                     Some(end) => end,
                     None => {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, InvalidAddr);
                         return;
                     }
                 };
@@ -2957,7 +2958,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     || buffer_ptr < VMAP_START
                     || buffer_end > VMAP_END
                 {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
                 let address_space_id = unsafe { CURRENT_ASID };
@@ -2965,7 +2966,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 if !validate_user_range(address_space_id, path_ptr, path_len, false)
                     || !validate_user_range(address_space_id, buffer_ptr, buffer_len, true)
                 {
-                    frame.x[0] = u64::MAX;
+                    set_syscall_error(frame, InvalidAddr);
                     return;
                 }
 
@@ -2992,7 +2993,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     let filesystem = match (*filesystem_ptr).as_mut() {
                         Some(filesystem) => filesystem,
                         None => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, ResourceUnavailable);
                             return;
                         }
                     };
@@ -3000,13 +3001,13 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     let stat = match filesystem.statPath(&path[..path_len]) {
                         Ok(stat) => stat,
                         Err(()) => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, Unknown);
                             return;
                         }
                     };
 
                     if stat.kind != filesystem::FileKind::Directory {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, NotDirectory);
                         return;
                     }
 
@@ -3051,7 +3052,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     );
 
                     if result.is_err() || overflow {
-                        frame.x[0] = u64::MAX;
+                        set_syscall_error(frame, Unknown);
                     } else {
                         frame.x[0] = written as u64;
                     }
@@ -3065,7 +3066,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                     let filesystem = match (*filesystem_ptr).as_mut() {
                         Some(filesystem) => filesystem,
                         None => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, ResourceUnavailable);
                             return;
                         }
                     };
@@ -3078,7 +3079,7 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                             frame.x[3] = block_size;
                         }
                         Err(()) => {
-                            frame.x[0] = u64::MAX;
+                            set_syscall_error(frame, Unknown);
                         }
                     }
                 }
@@ -3136,6 +3137,33 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
             core::arch::asm!("wfe");
         }
     }
+}
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum syscallError{
+    NotFound = 1,
+    Unsupported = 2,
+    InvalidArgument = 3,
+    ResourceUnavailable = 4,
+    PermissionDenied = 5,
+    AlreadyExists = 6,
+    NotDirectory = 7,
+    IsDirectory = 8,
+    DirectoryNotEmpty = 9,
+    BufferTooSmall = 10,
+    InvalidAddr = 11,
+    OoM = 12,
+    IoErr = 13,
+    WouldBlock = 14,
+    Unknown = 255
+}
+fn encode_error(error: syscallError) -> u64 {
+    (-(error as i64)) as u64
+}
+
+/// Places an encoded ABI error in the syscall return register.
+fn set_syscall_error(frame: &mut ExceptionFrame, error: syscallError) {
+    frame.x[0] = encode_error(error);
 }
 // ============================================================
 // IRQ

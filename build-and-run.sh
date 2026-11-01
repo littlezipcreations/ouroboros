@@ -11,12 +11,12 @@ echo "=== Building userspace binaries ==="
     cargo build --release --bins
 
     python3 ../ouro-pack.py \
-        target/aarch64-unknown-none/release/user-init \
-        user-init.run
+    target/aarch64-unknown-none/release/user-init \
+     user-init.run
 
     python3 ../ouro-pack.py \
         target/aarch64-unknown-none/release/hello \
-        hello.run
+       hello.run
 )
 
 echo "=== Installing binaries into OuroFS ==="
