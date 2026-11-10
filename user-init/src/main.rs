@@ -4,6 +4,7 @@
 
 use ouroboros_system::syscall;
 use ouroboros_system::print;
+use ouroboros_system::read_line;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
@@ -128,46 +129,6 @@ fn replace_line(buffer: &mut [u8], text_length: &mut usize, line_number: usize, 
 
     *text_length = new_total;
     true
-}
-
-fn read_line(buffer: &mut [u8]) -> usize {
-    let mut length = 0usize;
-
-    loop {
-        let byte = match syscall::read_byte() {
-            Ok(byte) => byte,
-            Err(syscall::Error::WouldBlock) => {
-                syscall::yield_now();
-                continue;
-            }
-            Err(error) => {
-                report_error(b"input", error);
-                syscall::yield_now();
-                continue;
-            }
-        };
-
-        match byte {
-            b'\r' | b'\n' => {
-                let _ = print!("\r\n");
-                return length;
-            }
-            8 | 127 => {
-                if length > 0 {
-                    length -= 1;
-                    let _ = print!("\x08 \x08");
-                }
-            }
-            0x20..=0x7e => {
-                if length < buffer.len() {
-                    buffer[length] = byte;
-                    length += 1;
-                    syscall::sys_write(&[byte]);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 fn print_hex_dump(bytes: &[u8]) {

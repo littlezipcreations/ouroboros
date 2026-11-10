@@ -3085,6 +3085,10 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 }
                 return;
             }
+            16 => {
+                frame.x[0] = TICKS.load(Ordering::Relaxed);
+                return;
+            }
             42 => {
                 writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
                 return;

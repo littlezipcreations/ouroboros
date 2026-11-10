@@ -1,7 +1,21 @@
-#![warn(dead_code)]
-#![warn(non_snake_case)]
-
+#[warn(dead_code)]
+#[warn(non_snake_case)]
 use core::arch::asm;
+
+/// Gets the system tick count.
+#[inline(always)]
+pub fn tick_count() -> Result<u64> {
+	let result: u64;
+
+	unsafe {
+		asm!(
+			"svc #16",
+			lateout("x0") result,
+		);
+	}
+
+	super::syscall::decodeResult(result)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

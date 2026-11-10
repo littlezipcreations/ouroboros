@@ -29,6 +29,7 @@ pub use syscall::{
 	spawn,
 	stat,
 	sys_write,
+	tick_count,
 	test,
 	write_file,
 	write_file_path,
@@ -109,4 +110,43 @@ macro_rules! println {
     ($($arg:tt)*) => {
         $crate::console::write_fmt(core::format_args!("{}\n", core::format_args!($($arg)*)))
     };
+}
+pub fn read_line(buffer: &mut [u8]) -> usize {
+    let mut length = 0usize;
+
+    loop {
+        let byte = match syscall::read_byte() {
+            Ok(byte) => byte,
+            Err(syscall::Error::WouldBlock) => {
+                syscall::yield_now();
+                continue;
+            }
+            Err(error) => {
+                println!("{:?}", error);
+                syscall::yield_now();
+                continue;
+            }
+        };
+
+        match byte {
+            b'\r' | b'\n' => {
+                let _ = print!("\r\n");
+                return length;
+            }
+            8 | 127 => {
+                if length > 0 {
+                    length -= 1;
+                    let _ = print!("\x08 \x08");
+                }
+            }
+            0x20..=0x7e => {
+                if length < buffer.len() {
+                    buffer[length] = byte;
+                    length += 1;
+                    syscall::sys_write(&[byte]);
+                }
+            }
+            _ => {}
+        }
+    }
 }

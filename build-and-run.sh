@@ -17,6 +17,15 @@ echo "=== Building userspace binaries ==="
     python3 ../ouro-pack.py \
         target/aarch64-unknown-none/release/hello \
        hello.run
+
+    python3 ../ouro-pack.py \
+        target/aarch64-unknown-none/release/top \
+       top.run
+
+    # Package the new RPN calculator binary
+    python3 ../ouro-pack.py \
+        target/aarch64-unknown-none/release/rpn \
+       rpn.run
 )
 
 echo "=== Installing binaries into OuroFS ==="
@@ -25,11 +34,15 @@ if [[ ! -f ouroboros.img ]]; then
     python3 ouro-image.py ouroboros.img \
         --create-mib 512 \
         --put /bin/user-init.run=user-init/user-init.run \
-        --put /bin/hello.run=user-init/hello.run
+        --put /bin/hello.run=user-init/hello.run \
+        --put /bin/top.run=user-init/top.run \
+        --put /bin/rpn.run=user-init/rpn.run
 else
     python3 ouro-image.py ouroboros.img \
         --put /bin/user-init.run=user-init/user-init.run \
-        --put /bin/hello.run=user-init/hello.run
+        --put /bin/hello.run=user-init/hello.run \
+        --put /bin/top.run=user-init/top.run \
+        --put /bin/rpn.run=user-init/rpn.run
 fi
 
 echo "=== Building kernel ==="

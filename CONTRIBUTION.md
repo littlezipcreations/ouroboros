@@ -19,8 +19,9 @@ You should not be changing any format specifications or client facing parts of t
 These could invalidate the setups of people, and so code or configuration may need to be changed just because one person decided that .run files were designed badly.
 
 ## My personal way of writing code
-Names of things are always in _camelCase_. I am aware that this is not rust convention, but sue me (please don't I am a broke 14 y/o with no life).
+Names of variables are always in _camelCase_. I am aware that this is not rust convention, but sue me (please don't I am a broke 14 y/o with no life).
 Comments are a thing that I personally forget to add. If they help you, feel free to add them. Feel free to add them to my bits of code!
 One thing that I do use comments for is to seperate sections by what they are doing, such as seperating RAM from Scheduler.
 These could just as well be put into their own files, but I believe that it is safer (if more unwieldy), to have everything required to boot the kernel to some degree in one file.
 Anything after that, that are not technically necessary, like the GPU or the filesystem can be put into their own file.
+Function names can be in either *snake_case* or _camelCase_. Consts are usually in *SCREAMING_SNAKE_CASE* (which is Rust convention).
