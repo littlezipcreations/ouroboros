@@ -26,6 +26,9 @@ echo "=== Building userspace binaries ==="
     python3 ../ouro-pack.py \
         target/aarch64-unknown-none/release/rpn \
        rpn.run
+    python3 ../ouro-pack.py \
+        target/aarch64-unknown-none/release/windows \
+       windows.run
 )
 
 echo "=== Installing binaries into OuroFS ==="
@@ -36,13 +39,14 @@ if [[ ! -f ouroboros.img ]]; then
         --put /bin/user-init.run=user-init/user-init.run \
         --put /bin/hello.run=user-init/hello.run \
         --put /bin/top.run=user-init/top.run \
-        --put /bin/rpn.run=user-init/rpn.run
+        --put /bin/rpn.run=user-init/rpn.run 
 else
     python3 ouro-image.py ouroboros.img \
         --put /bin/user-init.run=user-init/user-init.run \
         --put /bin/hello.run=user-init/hello.run \
         --put /bin/top.run=user-init/top.run \
-        --put /bin/rpn.run=user-init/rpn.run
+        --put /bin/rpn.run=user-init/rpn.run \
+        --put /bin/windows.run=user-init/windows.run
 fi
 
 echo "=== Building kernel ==="
@@ -62,8 +66,9 @@ if command -v qemu-system-aarch64 >/dev/null 2>&1; then
     -drive if=none,file=ouroboros.img,format=raw,id=ouroDisk \
     -device virtio-blk-device,drive=ouroDisk \
     -device virtio-gpu-device \
-    -device virtio-mouse-device \
-    -nographic
+    -device virtio-mouse-device #\
+    #-nographic
+
 else
     echo "qemu-system-aarch64 not found; skipping execution."
 fi

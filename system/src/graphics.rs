@@ -1,24 +1,112 @@
+
 #![warn(dead_code)]
 #![warn(non_snake_case)]
-pub fn put_pixel(x: i32, y: i32, colour: u32) {
-        // Ignore coordinates outside the display.
-        if x < 0
-            || y < 0
-            || x >= GPU_WIDTH as i32
-            || y >= GPU_HEIGHT as i32
-        {
+
+/// A rectangular drawing area backed by a pixel buffer.
+///
+/// Each pixel is a 32-bit colour value.
+/// The buffer is owned by the caller; Surface only borrows it.
+pub struct Surface<'a> {
+    width: usize,
+    height: usize,
+    stride: usize,
+    pixels: &'a mut [u32],
+}
+
+impl<'a> Surface<'a> {
+    /// Create a new surface.
+    ///
+    /// Returns None if the dimensions are invalid or the
+    /// supplied pixel buffer is too small.
+    pub fn new(
+        width: usize,
+        height: usize,
+        pixels: &'a mut [u32],
+    ) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let required = width.checked_mul(height)?;
+
+        if pixels.len() < required {
+            return None;
+        }
+
+        Some(Self {
+            width,
+            height,
+            stride: width,
+            pixels,
+        })
+    }
+
+    /// Return the surface width.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Return the surface height.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Return the number of pixels between rows.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Set one pixel.
+    ///
+    /// Coordinates outside the surface are ignored.
+    pub fn put_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        colour: u32,
+    ) {
+        if x < 0 || y < 0 {
             return;
         }
 
-        unsafe {
-            let framebuffer =
-                core::ptr::addr_of_mut!(FRAMEBUFFER.0) as *mut u32;
+        let x = x as usize;
+        let y = y as usize;
 
-            let index = y as usize * GPU_WIDTH + x as usize;
-            framebuffer.add(index).write_volatile(colour);
+        if x >= self.width || y >= self.height {
+            return;
         }
+
+        let index = y * self.stride + x;
+        self.pixels[index] = colour;
     }
-pub fn fill_rect(
+
+    /// Read one pixel.
+    ///
+    /// Returns None if the coordinates are outside the surface.
+    pub fn get_pixel(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> Option<u32> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+
+        let x = x as usize;
+        let y = y as usize;
+
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+
+        Some(self.pixels[y * self.stride + x])
+    }
+
+    /// Fill a rectangular area.
+    ///
+    /// Rectangles are clipped against the surface boundaries.
+    pub fn fill_rect(
+        &mut self,
         x: i32,
         y: i32,
         width: i32,
@@ -29,31 +117,30 @@ pub fn fill_rect(
             return;
         }
 
-        // Clip the rectangle against the framebuffer boundaries.
-        let left = x.max(0);
-        let top = y.max(0);
-        let right = x.saturating_add(width).min(GPU_WIDTH as i32);
-        let bottom = y.saturating_add(height).min(GPU_HEIGHT as i32);
+        let left = (x as i64).max(0);
+        let top = (y as i64).max(0);
+
+        let right = (x as i64 + width as i64)
+            .min(self.width as i64);
+
+        let bottom = (y as i64 + height as i64)
+            .min(self.height as i64);
 
         if left >= right || top >= bottom {
             return;
         }
 
-        unsafe {
-            let framebuffer =
-                core::ptr::addr_of_mut!(FRAMEBUFFER.0) as *mut u32;
+        for row in top as usize..bottom as usize {
+            let start = row * self.stride + left as usize;
+            let end = row * self.stride + right as usize;
 
-            for row in top..bottom {
-                let start = row as usize * GPU_WIDTH + left as usize;
-                let end = row as usize * GPU_WIDTH + right as usize;
-
-                for index in start..end {
-                    framebuffer.add(index).write_volatile(colour);
-                }
-            }
+            self.pixels[start..end].fill(colour);
         }
     }
-pub fn draw_rect(
+
+    /// Draw a rectangular outline.
+    pub fn draw_rect(
+        &mut self,
         x: i32,
         y: i32,
         width: i32,
@@ -65,17 +152,33 @@ pub fn draw_rect(
             return;
         }
 
-        // Four filled rectangles make the border.
-        Self::fill_rect(x, y, width, thickness, colour);
-        Self::fill_rect(
+        let thickness = thickness.min(width).min(height);
+
+        self.fill_rect(
+            x,
+            y,
+            width,
+            thickness,
+            colour,
+        );
+
+        self.fill_rect(
             x,
             y.saturating_add(height).saturating_sub(thickness),
             width,
             thickness,
             colour,
         );
-        Self::fill_rect(x, y, thickness, height, colour);
-        Self::fill_rect(
+
+        self.fill_rect(
+            x,
+            y,
+            thickness,
+            height,
+            colour,
+        );
+
+        self.fill_rect(
             x.saturating_add(width).saturating_sub(thickness),
             y,
             thickness,
@@ -83,8 +186,10 @@ pub fn draw_rect(
             colour,
         );
     }
-fn glyph_rows(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
+
+    /// Get the 5x7 bitmap for a character.
+    fn glyph_rows(character: char) -> [u8; 7] {
+        match character.to_ascii_uppercase() {
             'A' => [14, 17, 17, 31, 17, 17, 17],
             'B' => [30, 17, 17, 30, 17, 17, 30],
             'C' => [14, 17, 16, 16, 16, 17, 14],
@@ -138,17 +243,24 @@ fn glyph_rows(character: char) -> [u8; 7] {
             ')' => [8, 4, 2, 2, 2, 4, 8],
             '\'' => [4, 4, 8, 0, 0, 0, 0],
 
-            _ => [14, 17, 1, 2, 4, 0, 4], // Unknown character: ?
+            _ => [14, 17, 1, 2, 4, 0, 4],
         }
     }
-pub fn draw_char(x: i32, y: i32, character: char, colour: u32) {
+
+    /// Draw one 5x7 character.
+    pub fn draw_char(
+        &mut self,
+        x: i32,
+        y: i32,
+        character: char,
+        colour: u32,
+    ) {
         let rows = Self::glyph_rows(character);
 
         for (row_index, bits) in rows.iter().enumerate() {
             for column in 0..5 {
-                // The top bit of each 5-bit row is the leftmost pixel.
                 if bits & (1u8 << (4 - column)) != 0 {
-                    Self::put_pixel(
+                    self.put_pixel(
                         x.saturating_add(column as i32),
                         y.saturating_add(row_index as i32),
                         colour,
@@ -157,7 +269,13 @@ pub fn draw_char(x: i32, y: i32, character: char, colour: u32) {
             }
         }
     }
-pub fn draw_text(
+
+    /// Draw text.
+    ///
+    /// Characters are 5x7 pixels with one pixel of horizontal spacing
+    /// and two pixels of vertical spacing.
+    pub fn draw_text(
+        &mut self,
         mut x: i32,
         mut y: i32,
         text: &str,
@@ -172,20 +290,28 @@ pub fn draw_text(
                 continue;
             }
 
-            // Move to a new line if the next character would exceed the screen.
-            if x.saturating_add(5) > GPU_WIDTH as i32 {
+            if x.saturating_add(5) > self.width as i32 {
                 x = line_start;
                 y = y.saturating_add(9);
             }
 
-            if y >= GPU_HEIGHT as i32 {
+            if y >= self.height as i32 {
                 break;
             }
 
-            Self::draw_char(x, y, character, colour);
+            self.draw_char(x, y, character, colour);
             x = x.saturating_add(6);
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Mouse cursor
+// -----------------------------------------------------------------------------
+//
+// The cursor is also drawn onto a Surface.
+// It has no knowledge of the display or GPU.
+
 const CURSOR_WIDTH: usize = 16;
 const CURSOR_HEIGHT: usize = 16;
 
@@ -225,145 +351,110 @@ impl MouseCursor {
         }
     }
 
-    pub fn draw(&mut self) {
+    /// Draw the cursor onto a surface.
+    pub fn draw(&mut self, surface: &mut Surface<'_>) {
         if self.drawn {
-            self.erase();
+            self.erase(surface);
         }
 
-        self.x = self.x.clamp(
-            0,
-            GPU_WIDTH as i32 - CURSOR_WIDTH as i32,
-        );
-        self.y = self.y.clamp(
-            0,
-            GPU_HEIGHT as i32 - CURSOR_HEIGHT as i32,
-        );
-
-        self.paint();
+        self.clamp_position(surface);
+        self.paint(surface);
     }
 
-    pub fn move_by(&mut self, dx: i32, dy: i32) -> bool {
+    /// Move the cursor by a relative amount.
+    ///
+    /// Returns false if the cursor did not move.
+    pub fn move_by(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        surface: &mut Surface<'_>,
+    ) -> bool {
         if !self.drawn {
-            self.draw();
+            self.draw(surface);
         }
 
-        let new_x = self.x.saturating_add(dx).clamp(
-            0,
-            GPU_WIDTH as i32 - CURSOR_WIDTH as i32,
-        );
-        let new_y = self.y.saturating_add(dy).clamp(
-            0,
-            GPU_HEIGHT as i32 - CURSOR_HEIGHT as i32,
-        );
+        let old_x = self.x;
+        let old_y = self.y;
 
-        if new_x == self.x && new_y == self.y {
+        self.x = self.x.saturating_add(dx);
+        self.y = self.y.saturating_add(dy);
+
+        self.clamp_position(surface);
+
+        if self.x == old_x && self.y == old_y {
             return false;
         }
 
-        self.erase();
+        self.erase(surface);
+        self.paint(surface);
 
-        self.x = new_x;
-        self.y = new_y;
-
-        self.paint();
         true
     }
 
-    fn erase(&mut self) {
-        use core::ptr::write_volatile;
+    /// Clamp the cursor to the surface boundaries.
+    fn clamp_position(&mut self, surface: &Surface<'_>) {
+        let max_x = surface.width.saturating_sub(CURSOR_WIDTH) as i32;
+        let max_y = surface.height.saturating_sub(CURSOR_HEIGHT) as i32;
 
-        unsafe {
-            let framebuffer =
-                core::ptr::addr_of_mut!(FRAMEBUFFER.0) as *mut u32;
+        self.x = self.x.clamp(0, max_x.max(0));
+        self.y = self.y.clamp(0, max_y.max(0));
+    }
 
-            for row in 0..CURSOR_HEIGHT {
-                for col in 0..CURSOR_WIDTH {
-                    let x = self.x + col as i32;
-                    let y = self.y + row as i32;
-                    let saved_index = row * CURSOR_WIDTH + col;
+    /// Restore the pixels underneath the cursor.
+    fn erase(&mut self, surface: &mut Surface<'_>) {
+        for row in 0..CURSOR_HEIGHT {
+            for col in 0..CURSOR_WIDTH {
+                let x = self.x + col as i32;
+                let y = self.y + row as i32;
 
-                    if x >= 0
-                        && y >= 0
-                        && x < GPU_WIDTH as i32
-                        && y < GPU_HEIGHT as i32
-                    {
-                        let index =
-                            y as usize * GPU_WIDTH + x as usize;
+                let saved_index = row * CURSOR_WIDTH + col;
 
-                        write_volatile(
-                            framebuffer.add(index),
-                            self.saved[saved_index],
-                        );
-                    }
-                }
+                surface.put_pixel(
+                    x,
+                    y,
+                    self.saved[saved_index],
+                );
             }
         }
 
         self.drawn = false;
     }
 
-    fn paint(&mut self) {
-        use core::ptr::{read_volatile, write_volatile};
+    /// Save the background and draw the cursor.
+    fn paint(&mut self, surface: &mut Surface<'_>) {
+        // Save the pixels underneath the cursor.
+        for row in 0..CURSOR_HEIGHT {
+            for col in 0..CURSOR_WIDTH {
+                let x = self.x + col as i32;
+                let y = self.y + row as i32;
 
-        unsafe {
-            let framebuffer =
-                core::ptr::addr_of_mut!(FRAMEBUFFER.0) as *mut u32;
+                let saved_index = row * CURSOR_WIDTH + col;
 
-            // Save the pixels beneath the cursor before drawing it.
-            for row in 0..CURSOR_HEIGHT {
-                for col in 0..CURSOR_WIDTH {
-                    let x = self.x + col as i32;
-                    let y = self.y + row as i32;
-                    let saved_index = row * CURSOR_WIDTH + col;
-
-                    self.saved[saved_index] =
-                        if x >= 0
-                            && y >= 0
-                            && x < GPU_WIDTH as i32
-                            && y < GPU_HEIGHT as i32
-                        {
-                            let index =
-                                y as usize * GPU_WIDTH + x as usize;
-
-                            read_volatile(framebuffer.add(index))
-                        } else {
-                            0
-                        };
-                }
+                self.saved[saved_index] =
+                    surface.get_pixel(x, y).unwrap_or(0);
             }
+        }
 
-            // Draw the black outline and white interior.
-            for row in 0..CURSOR_HEIGHT {
-                let pattern = CURSOR_PATTERN[row].as_bytes();
+        // Draw the cursor.
+        for row in 0..CURSOR_HEIGHT {
+            let pattern = CURSOR_PATTERN[row].as_bytes();
 
-                for col in 0..CURSOR_WIDTH {
-                    let colour = match pattern[col] {
-                        b'#' => 0xFF00_0000,
-                        b'W' => 0xFFFF_FFFF,
-                        _ => continue,
-                    };
+            for col in 0..CURSOR_WIDTH {
+                let colour = match pattern[col] {
+                    b'#' => 0xFF00_0000,
+                    b'W' => 0xFFFF_FFFF,
+                    _ => continue,
+                };
 
-                    let x = self.x + col as i32;
-                    let y = self.y + row as i32;
-
-                    if x >= 0
-                        && y >= 0
-                        && x < GPU_WIDTH as i32
-                        && y < GPU_HEIGHT as i32
-                    {
-                        let index =
-                            y as usize * GPU_WIDTH + x as usize;
-
-                        write_volatile(
-                            framebuffer.add(index),
-                            colour,
-                        );
-                    }
-                }
+                surface.put_pixel(
+                    self.x + col as i32,
+                    self.y + row as i32,
+                    colour,
+                );
             }
         }
 
         self.drawn = true;
-        
     }
 }

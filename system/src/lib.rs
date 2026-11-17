@@ -34,7 +34,10 @@ pub use syscall::{
 	write_file,
 	write_file_path,
 	yield_now,
+        graphics_blit,
+        graphics_present,
 };
+pub mod graphics;
 /// A result returned by the Ouroboros userspace library.
 pub fn errorMessage(error: Error) -> &'static str {
 	match error {

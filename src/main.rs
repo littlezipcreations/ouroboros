@@ -7,6 +7,7 @@ mod virtio;
 use virtio::VirtioBlk;
 mod virtio_gpu;
 use virtio_gpu::VirtioGpu;
+use core::sync::atomic::AtomicBool;
 mod virtio_input;
 use virtio_input::{
     VirtioInput,
@@ -29,7 +30,10 @@ use crate::MappingError::AlreadyMapped;
 use crate::RunLoadError::InvalidExecutable;
 use crate::TaskCreationError::{FailedAlloc, NoFreeSlot};
 use crate::syscallError::{InvalidAddr, IoErr, NotDirectory, OoM, PermissionDenied, ResourceUnavailable, Unknown, WouldBlock};
+use crate::syscallError::InvalidArgument;
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static GPU: VirtioGpu = VirtioGpu::new();
+static GPU_READY: AtomicBool = AtomicBool::new(false);
 // ============================================================
 // UART
 // ============================================================
@@ -3089,6 +3093,87 @@ extern "C" fn exception_sync_rust(frame: &mut ExceptionFrame) {
                 frame.x[0] = TICKS.load(Ordering::Relaxed);
                 return;
             }
+
+
+20 => {
+    if !GPU_READY.load(Ordering::Acquire) {
+        set_syscall_error(frame, ResourceUnavailable);
+        return;
+    }
+
+    let x = frame.x[0] as usize;
+    let y = frame.x[1] as usize;
+    let width = frame.x[2] as usize;
+    let height = frame.x[3] as usize;
+    let pixel_ptr = frame.x[4] as usize;
+    let pixel_count = frame.x[5] as usize;
+
+    let required = match width.checked_mul(height) {
+        Some(count) => count,
+        None => {
+            set_syscall_error(frame, InvalidArgument);
+            return;
+        }
+    };
+
+    let byte_len = match required.checked_mul(
+        core::mem::size_of::<u32>()
+    ) {
+        Some(len) => len,
+        None => {
+            set_syscall_error(frame, InvalidArgument);
+            return;
+        }
+    };
+
+    if required == 0 || pixel_count != required {
+        set_syscall_error(frame, InvalidArgument);
+        return;
+    }
+
+    if pixel_ptr % core::mem::align_of::<u32>() != 0
+        || !validate_user_range(
+            unsafe { CURRENT_ASID },
+            pixel_ptr,
+            byte_len,
+            false,
+        )
+    {
+        set_syscall_error(frame, InvalidAddr);
+        return;
+    }
+
+    let pixels = unsafe {
+        core::slice::from_raw_parts(
+            pixel_ptr as *const u32,
+            required,
+        )
+    };
+
+    if GPU.blit(x, y, width, height, pixels) {
+        frame.x[0] = 0;
+    } else {
+        set_syscall_error(frame, InvalidArgument);
+    }
+
+    return;
+}
+            
+
+21 => {
+    if !GPU_READY.load(Ordering::Acquire) {
+        set_syscall_error(frame, ResourceUnavailable);
+        return;
+    }
+
+    if GPU.present_frame() {
+        frame.x[0] = 0;
+    } else {
+        set_syscall_error(frame, IoErr);
+    }
+
+    return;
+}
             42 => {
                 writeln!(uart, "SVC #42 triggered. Life, the universe and everything?");
                 return;
@@ -3298,7 +3383,7 @@ pub extern "C" fn rust_start() -> ! {
     }
     writeln!(uart, "Initialising VirtIO GPU...").unwrap();
 
-    let gpu = VirtioGpu::new();
+    let gpu = &GPU;
     let (magic, version, device_id) = gpu.probe();
 
     writeln!(
@@ -3324,6 +3409,12 @@ pub extern "C" fn rust_start() -> ! {
         Err(error) => {
             writeln!(uart, "GPU display query failed: {:?}", error).unwrap();
         }
+    }
+    if gpu.show_background(0xFF000000) {
+        GPU_READY.store(true, Ordering::Release);
+        writeln!(uart, "GPU framebuffer ready!").unwrap();
+    } else {
+        writeln!(uart, "GPU framebuffer initialisation failed!").unwrap();
     }
     writeln!(uart, "Initialising virtio block device...").unwrap();
 

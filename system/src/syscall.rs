@@ -414,3 +414,45 @@ pub fn disk_usage() -> Result<FilesystemUsage> {
 		block_size: blockSize,
 	})
 }
+
+/// Copies a rectangular pixel buffer into the display framebuffer.
+#[inline(always)]
+pub fn graphics_blit(
+	x: usize,
+	y: usize,
+	width: usize,
+	height: usize,
+	pixels: &[u32],
+) -> Result<()> {
+	let result: u64;
+
+	unsafe {
+		asm!(
+			"svc #20",
+			in("x0") x,
+			in("x1") y,
+			in("x2") width,
+			in("x3") height,
+			in("x4") pixels.as_ptr(),
+			in("x5") pixels.len(),
+			lateout("x0") result,
+		);
+	}
+
+	decodeResult(result).map(|_| ())
+}
+
+/// Presents pending framebuffer changes.
+#[inline(always)]
+pub fn graphics_present() -> Result<()> {
+	let result: u64;
+
+	unsafe {
+		asm!(
+			"svc #21",
+			lateout("x0") result,
+		);
+	}
+
+	decodeResult(result).map(|_| ())
+}

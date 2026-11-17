@@ -660,6 +660,62 @@ impl VirtioGpu{
 
         true
     }
+    /// Copies a rectangular pixel buffer into the framebuffer.
+    ///
+    /// Pixels use BGRA8 format (u32).
+    pub fn blit(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        pixels: &[u32],
+    ) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+
+        let Some(right) = x.checked_add(width) else {
+            return false;
+        };
+
+        let Some(bottom) = y.checked_add(height) else {
+            return false;
+        };
+
+        if right > GPU_WIDTH || bottom > GPU_HEIGHT {
+            return false;
+        }
+
+        let Some(required) = width.checked_mul(height) else {
+            return false;
+        };
+
+        if pixels.len() < required {
+            return false;
+        }
+
+        unsafe {
+            let framebuffer =
+                core::ptr::addr_of_mut!(FRAMEBUFFER.0) as *mut u32;
+
+            for row in 0..height {
+                let destination = framebuffer.add(
+                    (y + row) * GPU_WIDTH + x
+                );
+
+                let source = pixels.as_ptr().add(row * width);
+
+                core::ptr::copy_nonoverlapping(
+                    source,
+                    destination,
+                    width,
+                );
+            }
+        }
+
+        true
+    }
     pub fn present_frame(&self) -> bool {
         use core::mem::size_of_val;
 

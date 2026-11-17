@@ -318,6 +318,17 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
 
 fn shell() -> ! {
     let _ = print!("Welcome to Ouroboros!\r\n");
+    let pixels = [0xFFFF0000u32; 100 * 100];
+
+syscall::graphics_blit(
+	100,
+	100,
+	100,
+	100,
+	&pixels,
+).unwrap();
+
+syscall::graphics_present().unwrap();
     const FILE_BUFFER_PAGES: usize = 12;
     const FILE_BUFFER_SIZE: usize = FILE_BUFFER_PAGES * 4096;
 
