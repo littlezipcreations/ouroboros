@@ -2,11 +2,14 @@
 #![no_main]
 #![warn(non_snake_case)]
 
+use ouroboros_system::console;
 use ouroboros_system::syscall;
 use ouroboros_system::print;
 use ouroboros_system::read_line;
 use core::arch::asm;
 use core::panic::PanicInfo;
+
+static TEST_PIXELS: [u32; 16 * 16] = [0xFFFF0000; 16 * 16];
 
 fn write_number(value: u64) {
     let _ = print!("{}", value);
@@ -33,7 +36,7 @@ fn error_message(error: syscall::Error) -> &'static str {
 }
 
 fn report_error(command: &[u8], error: syscall::Error) {
-    let _ = syscall::sys_write(command);
+    let _ = console::write_bytes(command);
     let _ = print!(": {}\r\n", error_message(error));
 }
 
@@ -46,7 +49,10 @@ fn write_hex_u64(value: u64) {
 }
 
 fn strip_spaces(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
     let end = bytes
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -62,7 +68,6 @@ fn parse_usize(bytes: &[u8]) -> Option<usize> {
     }
 
     let mut value = 0usize;
-
     for &byte in bytes {
         if !(b'0'..=b'9').contains(&byte) {
             return None;
@@ -74,7 +79,12 @@ fn parse_usize(bytes: &[u8]) -> Option<usize> {
     Some(value)
 }
 
-fn replace_line(buffer: &mut [u8], text_length: &mut usize, line_number: usize, new_text: &[u8]) -> bool {
+fn replace_line(
+    buffer: &mut [u8],
+    text_length: &mut usize,
+    line_number: usize,
+    new_text: &[u8],
+) -> bool {
     if line_number == 0 {
         return false;
     }
@@ -94,7 +104,6 @@ fn replace_line(buffer: &mut [u8], text_length: &mut usize, line_number: usize, 
                 found = true;
                 break;
             }
-
             line_start = line_end + 1;
             line_index += 1;
         }
@@ -105,7 +114,11 @@ fn replace_line(buffer: &mut [u8], text_length: &mut usize, line_number: usize, 
         return false;
     }
 
-    let kept_newline = if match_end < *text_length && buffer[match_end] == b'\n' { 1usize } else { 0usize };
+    let kept_newline = if match_end < *text_length && buffer[match_end] == b'\n' {
+        1usize
+    } else {
+        0usize
+    };
     let old_line_length = match_end - match_start;
     let new_length = new_text.len();
     let tail_start = match_end + kept_newline;
@@ -142,7 +155,6 @@ fn print_hex_dump(bytes: &[u8]) {
 
         write_hex_u64(offset as u64);
         let _ = print!(": ");
-
         for (index, byte) in line.iter().enumerate() {
             if index == 8 {
                 let _ = print!(" ");
@@ -157,7 +169,6 @@ fn print_hex_dump(bytes: &[u8]) {
         if line.len() <= 8 {
             let _ = print!(" ");
         }
-
         let _ = print!("|");
         for byte in line {
             let printable = *byte >= 0x20 && *byte <= 0x7e;
@@ -180,7 +191,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
 
     if text_length > 0 {
         let _ = print!("Current contents:\r\n");
-        syscall::sys_write(&scratch[..text_length]);
+        let _ = console::write_bytes(&scratch[..text_length]);
         if !scratch[..text_length].ends_with(b"\n") {
             let _ = print!("\r\n");
         }
@@ -190,7 +201,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
     }
 
     let mut line = [0u8; 128];
-
     loop {
         let _ = print!("edit> ");
         let line_length = read_line(&mut line);
@@ -212,7 +222,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
             }
             b":view" | b":list" => {
                 if text_length > 0 {
-                    syscall::sys_write(&scratch[..text_length]);
+                    let _ = console::write_bytes(&scratch[..text_length]);
                     if !scratch[..text_length].ends_with(b"\n") {
                         let _ = print!("\r\n");
                     }
@@ -229,7 +239,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                         continue;
                     }
                 };
-
                 let line_number = match parse_usize(&rest[..separator]) {
                     Some(value) => value,
                     None => {
@@ -239,7 +248,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 };
 
                 let new_text = strip_spaces(&rest[separator + 1..]);
-
                 if replace_line(scratch, &mut text_length, line_number, new_text) {
                     let _ = print!("Line updated.\r\n");
                 } else {
@@ -255,7 +263,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                         continue;
                     }
                 };
-
                 let line_number = match parse_usize(&rest[..separator]) {
                     Some(value) => value,
                     None => {
@@ -265,7 +272,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                 };
 
                 let new_text = strip_spaces(&rest[separator + 1..]);
-
                 if replace_line(scratch, &mut text_length, line_number, new_text) {
                     let _ = print!("Line updated.\r\n");
                 } else {
@@ -278,7 +284,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                         let _ = print!("Saved ");
                         write_number(count as u64);
                         let _ = print!(" bytes to ");
-                        syscall::sys_write(path);
+                        let _ = console::write_bytes(path);
                         let _ = print!("\r\n");
                     }
                     Err(error) => report_error(b"edit: save", error),
@@ -294,7 +300,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                         let _ = print!("Saved ");
                         write_number(count as u64);
                         let _ = print!(" bytes to ");
-                        syscall::sys_write(path);
+                        let _ = console::write_bytes(path);
                         let _ = print!("\r\n");
                         return true;
                     }
@@ -306,7 +312,6 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
                     let _ = print!("edit: buffer full\r\n");
                     continue;
                 }
-
                 scratch[text_length..text_length + command.len()].copy_from_slice(command);
                 text_length += command.len();
                 scratch[text_length] = b'\n';
@@ -318,17 +323,7 @@ fn edit_file(path: &[u8], scratch: &mut [u8]) -> bool {
 
 fn shell() -> ! {
     let _ = print!("Welcome to Ouroboros!\r\n");
-    let pixels = [0xFFFF0000u32; 100 * 100];
 
-syscall::graphics_blit(
-	100,
-	100,
-	100,
-	100,
-	&pixels,
-).unwrap();
-
-syscall::graphics_present().unwrap();
     const FILE_BUFFER_PAGES: usize = 12;
     const FILE_BUFFER_SIZE: usize = FILE_BUFFER_PAGES * 4096;
 
@@ -342,7 +337,6 @@ syscall::graphics_present().unwrap();
 
     let mut line = [0u8; 128];
     let mut ignore_next_lf = false;
-
     loop {
         let _ = print!("ouro> ");
         let mut length = 0;
@@ -376,27 +370,23 @@ syscall::graphics_present().unwrap();
                     let _ = print!("\r\n");
                     break;
                 }
-
                 b'\n' => {
                     let _ = print!("\r\n");
                     break;
                 }
-
                 8 | 127 => {
                     if length > 0 {
                         length -= 1;
                         let _ = print!("\x08 \x08");
                     }
                 }
-
                 0x20..=0x7e => {
                     if length < line.len() {
                         line[length] = byte;
                         length += 1;
-                        syscall::sys_write(&[byte]);
+                        let _ = console::write_bytes(&[byte]);
                     }
                 }
-
                 _ => {}
             }
         }
@@ -415,16 +405,17 @@ syscall::graphics_present().unwrap();
                   \x20         rm, mkdir, rmdir, run, edit, hex\r\n\
                   Paths must be absolute.\r\n");
         }
-
         // ----------------------------------------------------
         // df
         // ----------------------------------------------------
         else if command == b"df" || command.starts_with(b"df ") {
             let usage = match syscall::disk_usage() {
                 Ok(usage) => usage,
-                Err(error) => { report_error(b"df", error); continue; }
+                Err(error) => {
+                    report_error(b"df", error);
+                    continue;
+                }
             };
-
             let total_kib = usage.total_blocks.saturating_mul(usage.block_size) / 1024;
             let used_kib = usage.used_blocks.saturating_mul(usage.block_size) / 1024;
             let available_kib = usage.available_blocks.saturating_mul(usage.block_size) / 1024;
@@ -433,7 +424,6 @@ syscall::graphics_present().unwrap();
             } else {
                 (used_kib * 100) / total_kib
             };
-
             let _ = print!("Filesystem     1K-blocks  Used Available Use% Mounted on\r\n");
             let _ = print!("rootfs         ");
             write_number(total_kib);
@@ -445,7 +435,6 @@ syscall::graphics_present().unwrap();
             write_number(used_percent);
             let _ = print!("% /\r\n");
         }
-
         // ----------------------------------------------------
         // hex <path>
         // ----------------------------------------------------
@@ -461,23 +450,22 @@ syscall::graphics_present().unwrap();
                 Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
-                Err(error) => { report_error(b"hex: buffer allocation", error); continue; }
+                Err(error) => {
+                    report_error(b"hex: buffer allocation", error);
+                    continue;
+                }
             };
 
             match syscall::read_file(path, buffer) {
-                Ok(count) => {
-                    print_hex_dump(&buffer[..count]);
-                }
+                Ok(count) => print_hex_dump(&buffer[..count]),
                 Err(error) => report_error(b"hex", error),
             }
         }
-
         // ----------------------------------------------------
         // edit <path>
         // ----------------------------------------------------
         else if command.starts_with(b"edit ") {
             let path = strip_spaces(&command[5..]);
-
             if path.is_empty() {
                 let _ = print!("Usage: edit /path\r\n");
                 continue;
@@ -487,12 +475,14 @@ syscall::graphics_present().unwrap();
                 Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, FILE_BUFFER_SIZE)
                 },
-                Err(error) => { report_error(b"edit: buffer allocation", error); continue; }
+                Err(error) => {
+                    report_error(b"edit: buffer allocation", error);
+                    continue;
+                }
             };
 
             let _ = edit_file(path, buffer);
         }
-
         // ----------------------------------------------------
         // stat <path>
         // ----------------------------------------------------
@@ -506,7 +496,6 @@ syscall::graphics_present().unwrap();
 
                     let _ = print!("\r\nsize: ");
                     write_number(info.size);
-
                     let _ = print!("\r\ntype: ");
 
                     if info.kind == syscall::FILE_KIND_FILE {
@@ -516,38 +505,34 @@ syscall::graphics_present().unwrap();
                     } else {
                         let _ = print!("unknown");
                     }
-
                     let _ = print!("\r\nlinks: ");
                     write_number(info.links);
                     let _ = print!("\r\n");
                 }
-
                 Err(error) => report_error(b"stat", error),
             }
         }
-
         // ----------------------------------------------------
         // cat <path>
         // ----------------------------------------------------
         else if command.starts_with(b"cat ") {
             let path = &command[4..];
-
             let buffer_ptr = match file_buffer {
                 Ok(ptr) => ptr,
-                Err(error) => { report_error(b"cat: buffer allocation", error); continue; }
+                Err(error) => {
+                    report_error(b"cat: buffer allocation", error);
+                    continue;
+                }
             };
 
             let output = unsafe {
-                core::slice::from_raw_parts_mut(
-                    buffer_ptr,
-                    FILE_BUFFER_SIZE,
-                )
+                core::slice::from_raw_parts_mut(buffer_ptr, FILE_BUFFER_SIZE)
             };
 
             match syscall::read_file(path, output) {
                 Ok(count) => {
                     if count > 0 {
-                        syscall::sys_write(&output[..count]);
+                        let _ = console::write_bytes(&output[..count]);
 
                         if output[count - 1] != b'\n' {
                             let _ = print!("\r\n");
@@ -556,97 +541,84 @@ syscall::graphics_present().unwrap();
                         let _ = print!("\r\n");
                     }
                 }
-
                 Err(error) => report_error(b"cat", error),
             }
         }
-
         // ----------------------------------------------------
         // touch <path>
         // ----------------------------------------------------
         else if command.starts_with(b"touch ") {
             let path = &command[6..];
-
             let buffer_ptr = match file_buffer {
                 Ok(ptr) => ptr,
-                Err(error) => { report_error(b"touch: buffer allocation", error); continue; }
+                Err(error) => {
+                    report_error(b"touch: buffer allocation", error);
+                    continue;
+                }
             };
 
             // The zero-length slice points into allocated
             // userspace memory, rather than kernel text.
-            let empty_data = unsafe {
-                core::slice::from_raw_parts(buffer_ptr, 0)
-            };
-
+            let empty_data = unsafe { core::slice::from_raw_parts(buffer_ptr, 0) };
             match syscall::create_file(path, empty_data) {
                 Ok(inode) => {
                     let _ = print!("Created inode ");
                     write_number(inode as u64);
                     let _ = print!("\r\n");
                 }
-
                 Err(error) => report_error(b"touch", error),
             }
         }
-
         // ----------------------------------------------------
         // write <path> <contents>
         // Replaces the file's entire contents.
         // ----------------------------------------------------
         else if command.starts_with(b"write ") {
             let arguments = &command[6..];
-
             match arguments.iter().position(|&byte| byte == b' ') {
                 Some(separator) if separator > 0 => {
                     let path = &arguments[..separator];
                     let contents = &arguments[separator + 1..];
-
                     match syscall::write_file(path, contents) {
                         Ok(count) => {
                             let _ = print!("Wrote ");
                             write_number(count as u64);
                             let _ = print!(" bytes\r\n");
                         }
-
                         Err(error) => report_error(b"write", error),
                     }
                 }
-
                 _ => {
                     let _ = print!("Usage: write /path contents\r\n");
                 }
             }
         }
-
         // ----------------------------------------------------
         // rm <path>
         // ----------------------------------------------------
         else if command.starts_with(b"rm ") {
             let path = &command[3..];
-
             match syscall::delete_file(path) {
-                Ok(()) => { let _ = print!("File deleted.\r\n"); }
+                Ok(()) => {
+                    let _ = print!("File deleted.\r\n");
+                }
                 Err(error) => report_error(b"rm", error),
             }
         }
-
         // ----------------------------------------------------
         // mkdir <path>
         // ----------------------------------------------------
         else if command.starts_with(b"mkdir ") {
             let path = &command[6..];
-
             match syscall::create_dir(path) {
                 Ok(inode) => {
                     let _ = print!("Created directory inode ");
                     write_number(inode as u64);
                     let _ = print!("\r\n");
                 }
-
                 Err(error) => report_error(b"mkdir", error),
             }
         }
-
         // ----------------------------------------------------
         // rmdir <path>
         // ----------------------------------------------------
@@ -654,28 +626,31 @@ syscall::graphics_present().unwrap();
             let path = &command[6..];
 
             match syscall::remove_dir(path) {
-                Ok(()) => { let _ = print!("Directory removed.\r\n"); }
+                Ok(()) => {
+                    let _ = print!("Directory removed.\r\n");
+                }
                 Err(error) => report_error(b"rmdir", error),
             }
         }
-
         // ----------------------------------------------------
         // run <path>
         // ----------------------------------------------------
         else if command.starts_with(b"run ") {
             let path = &command[4..];
-            if path == b"/bin/user-init.run"{let _ = print!("You should NOT be trying to open a nested shell.\r\n"); continue;}
+            if path == b"/bin/user-init.run" {
+                let _ = print!("You should NOT be trying to open a nested shell.\r\n");
+                continue;
+            }
+
             match syscall::spawn(path) {
                 Ok(task_id) => {
                     let _ = print!("Completed task ");
                     write_number(task_id as u64);
                     let _ = print!("\r\n");
                 }
-
                 Err(error) => report_error(b"run", error),
             }
         }
-
         // ----------------------------------------------------
         // ls <path>
         // ----------------------------------------------------
@@ -702,12 +677,15 @@ syscall::graphics_present().unwrap();
                 Ok(ptr) => unsafe {
                     core::slice::from_raw_parts_mut(ptr, 12 * 4096)
                 },
-                Err(error) => { report_error(b"ls: buffer allocation", error); continue; }
+                Err(error) => {
+                    report_error(b"ls: buffer allocation", error);
+                    continue;
+                }
             };
 
             match syscall::list_directory(path, buffer) {
                 Ok(count) => {
-                    syscall::sys_write(&buffer[..count]);
+                    let _ = console::write_bytes(&buffer[..count]);
                 }
                 Err(error) => report_error(b"ls", error),
             }
@@ -717,7 +695,7 @@ syscall::graphics_present().unwrap();
         // ----------------------------------------------------
         else {
             let _ = print!("Unknown command: ");
-            syscall::sys_write(command);
+            let _ = console::write_bytes(command);
             let _ = print!("\r\n");
         }
     }
@@ -749,4 +727,4 @@ fn panic(_info: &PanicInfo) -> ! {
             asm!("svc #2", options(nomem, nostack));
         }
     }
-}  
+}

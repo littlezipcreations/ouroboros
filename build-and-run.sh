@@ -62,6 +62,8 @@ if command -v qemu-system-aarch64 >/dev/null 2>&1; then
     -cpu cortex-a76 \
     -m 512M \
     -display sdl \
+    -serial stdio \
+    -monitor none \
     -kernel target/aarch64-unknown-none/release/ouroboros \
     -drive if=none,file=ouroboros.img,format=raw,id=ouroDisk \
     -device virtio-blk-device,drive=ouroDisk \

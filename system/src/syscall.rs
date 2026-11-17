@@ -1,3 +1,4 @@
+
 #[warn(dead_code)]
 #[warn(non_snake_case)]
 use core::arch::asm;
@@ -74,7 +75,6 @@ fn decodeResult(value: u64) -> Result<u64> {
 	}
 
 	let code = signedValue.unsigned_abs();
-
 	let error = match code {
 		1 => Error::NotFound,
 		2 => Error::Unsupported,
@@ -118,7 +118,7 @@ pub fn exit() -> ! {
 	}
 }
 
-/// Writes bytes to the standard output.
+/// Writes bytes to the standard output (UART).
 #[inline(always)]
 pub fn sys_write(buffer: &[u8]) -> Result<usize> {
 	let result: u64;
